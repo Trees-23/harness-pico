@@ -1,21 +1,29 @@
+import asyncio
 import os
 import json
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
 import pico as mini_pkg
+import pico.cli as mini_cli
+from pico import checkpoint as checkpointlib
 from pico import (
     AnthropicCompatibleModelClient,
     FakeModelClient,
+    ModelResponse,
     MiniAgent,
     OllamaModelClient,
     OpenAICompatibleModelClient,
     SessionStore,
+    ToolCallRequest,
     WorkspaceContext,
+    build_tools_help,
     build_welcome,
 )
+from pico.memory import MemoryStore
 
 
 def build_workspace(tmp_path):
@@ -96,7 +104,7 @@ def test_agent_only_stores_reusable_epistemic_notes(tmp_path):
 
     assert resumed.ask("What color is the deploy key?") == "It is red."
     prompt = resumed.model_client.prompts[-1]
-    assert "Relevant memory" in prompt
+    assert "Relevant memory" not in prompt
     assert "deploy key is red" in prompt
 
 
@@ -120,7 +128,7 @@ def test_file_summary_cache_is_invalidated_on_out_of_band_edit_and_path_spelling
         approval_policy="auto",
     )
 
-    assert "sample.txt: alpha" not in resumed.memory_text()
+    assert "sample.txt: alpha" not in resumed.memory.render_memory_text()
     resumed.memory.invalidate_file_summary("sample.txt")
     assert "sample.txt" not in resumed.memory.to_dict()["file_summaries"]
 
@@ -195,6 +203,13 @@ def test_agent_saves_and_resumes_session(tmp_path):
     agent = build_agent(tmp_path, ["<final>First pass.</final>"])
     assert agent.ask("Start a session") == "First pass."
 
+    session_dir = tmp_path / ".pico" / "sessions" / agent.session["id"]
+    history_path = session_dir / "cli_direct.jsonl"
+    assert history_path.exists()
+    assert not (session_dir / "session.json").exists()
+    assert not (session_dir / "history.jsonl").exists()
+    assert "Start a session" in history_path.read_text(encoding="utf-8")
+
     resumed = MiniAgent.from_session(
         model_client=FakeModelClient(["<final>Resumed.</final>"]),
         workspace=agent.workspace,
@@ -205,6 +220,91 @@ def test_agent_saves_and_resumes_session(tmp_path):
 
     assert resumed.session["history"][0]["content"] == "Start a session"
     assert resumed.ask("Continue") == "Resumed."
+
+
+def test_agent_compacts_old_history_into_archived_session_summary(tmp_path):
+    agent = build_agent(
+        tmp_path,
+        [
+            "- Current goal: Continue editing runtime.py\n- Key files: runtime.py, memory.py\n- Next step: inspect the recent transcript",
+            "<final>Compaction complete.</final>",
+        ],
+    )
+
+    for index in range(12):
+        role = "user" if index % 2 == 0 else "assistant"
+        agent.record(
+            {
+                "role": role,
+                "content": f"history-{index} " + ("X" * 420),
+                "created_at": f"2026-04-07T09:{index:02d}:00+00:00",
+            }
+        )
+
+    answer = agent.ask("Continue editing runtime.py")
+
+    assert answer == "Compaction complete."
+    assert agent.session["history_archive"]["compaction_count"] == 1
+    assert agent.session["history_archive"]["archived_messages"] > 0
+    assert "runtime.py" in agent.session["history_archive"]["latest_summary"]
+    assert agent.session["last_consolidated"] > 0
+    assert len(agent.session["history"]) == 14
+    assert "[Resumed Session]" in agent.model_client.prompts[-1]
+    assert "runtime.py" in agent.model_client.prompts[-1]
+    assert (tmp_path / ".pico" / "memory" / "history.jsonl").exists()
+
+
+def test_agent_registers_dream_cron_and_cron_processes_pending_archive(tmp_path):
+    workspace = build_workspace(tmp_path)
+    store = SessionStore(tmp_path / ".pico" / "sessions")
+    archive_store = MemoryStore(tmp_path)
+    archive_store.append_history("- User prefers concise technical responses.")
+    agent = MiniAgent(
+        model_client=FakeModelClient(
+            [
+                "<final>Main turn complete.</final>",
+                "- Persist the user's stable communication preference into USER.md.",
+                '<tool name="patch_file" path=".pico/USER.md"><old_text>- [ ] Technical</old_text><new_text>- [x] Technical</new_text></tool>',
+                "<final>done</final>",
+            ]
+        ),
+        workspace=workspace,
+        session_store=store,
+        approval_policy="auto",
+    )
+
+    answer = agent.ask("Continue")
+
+    assert answer == "Main turn complete."
+    assert archive_store.get_last_dream_cursor() == 0
+    dream_job = next(job for job in agent.cron.list_jobs(include_disabled=True) if job.id == "dream")
+    dream_job.state.next_run_at_ms = 1
+    asyncio.run(agent.cron._on_timer())
+
+    assert archive_store.get_last_dream_cursor() == 1
+    assert "- [x] Technical" in (tmp_path / ".pico" / "USER.md").read_text(encoding="utf-8")
+
+
+def test_agent_promotes_user_facts_into_history_without_using_assistant_reply(tmp_path):
+    agent = build_agent(
+        tmp_path,
+        [
+            "<final>真不错！</final>",
+            "<final>其实你只有一只猫。</final>",
+            "<final>继续。</final>",
+        ],
+    )
+
+    agent.ask("我有两只猫")
+    agent.ask("我有两只狗")
+    agent.ask("我有几个宠物")
+
+    prompt = agent.model_client.prompts[-1]
+
+    assert "Relevant memory:" not in prompt
+    assert "我有两只猫" in prompt
+    assert "我有两只狗" in prompt
+    assert "其实你只有一只猫" in prompt
 
 
 def test_delegate_uses_child_agent(tmp_path):
@@ -249,9 +349,43 @@ def test_invalid_risky_tool_does_not_prompt_for_approval(tmp_path):
     with patch("builtins.input") as mock_input:
         result = agent.run_tool("write_file", {})
 
-    assert result.startswith("error: invalid arguments for write_file: 'path'")
+    assert result.startswith("error: invalid arguments for write_file: Invalid parameters")
+    assert "missing required path" in result
+    assert "missing required content" in result
     assert 'example: <tool name="write_file"' in result
     mock_input.assert_not_called()
+
+
+def test_run_tool_uses_registry_prepare_call_for_argument_governance(tmp_path):
+    agent = build_agent(tmp_path, [])
+
+    with patch("pico.tools.validate_tool", side_effect=AssertionError("legacy validator bypassed")):
+        with patch.object(agent.tool_registry, "prepare_call", wraps=agent.tool_registry.prepare_call) as prepare_call:
+            result = agent.run_tool("write_file", {})
+
+    assert "missing required path" in result
+    assert "missing required content" in result
+    prepare_call.assert_called_once()
+
+
+def test_write_tools_acquire_same_file_lock(tmp_path):
+    class SpyLocks:
+        def __init__(self):
+            self.keys = []
+
+        @contextmanager
+        def lock(self, key):
+            self.keys.append(key)
+            yield
+
+    agent = build_agent(tmp_path, [])
+    spy_locks = SpyLocks()
+    agent.tool_executor.file_locks = spy_locks
+
+    result = agent.run_tool("write_file", {"path": "locked.txt", "content": "hello\n"})
+
+    assert result == "wrote locked.txt (6 chars)"
+    assert spy_locks.keys == [str((tmp_path / "locked.txt").resolve())]
 
 
 def test_list_files_hides_internal_agent_state(tmp_path):
@@ -275,6 +409,41 @@ def test_repeated_identical_tool_call_is_rejected(tmp_path):
     result = agent.run_tool("list_files", {})
 
     assert result == "error: repeated identical tool call for list_files; choose a different tool or return a final answer"
+
+
+def test_repeated_read_file_overlapping_range_is_rejected(tmp_path):
+    (tmp_path / "hello.txt").write_text("alpha\nbeta\n", encoding="utf-8")
+    agent = build_agent(tmp_path, [])
+    agent.record(
+        {
+            "role": "tool",
+            "name": "read_file",
+            "args": {"path": "hello.txt", "start": 1, "end": 200},
+            "content": "# hello.txt\n   1: alpha\n   2: beta",
+            "created_at": "1",
+        }
+    )
+
+    result = agent.run_tool("read_file", {"path": "hello.txt", "start": 1, "end": 260})
+
+    assert result.startswith("error: repeated read_file call for an overlapping already-read file range")
+
+
+def test_repeated_write_file_after_success_is_rejected_before_approval(tmp_path):
+    agent = build_agent(tmp_path, [], approval_policy="ask")
+    agent.record(
+        {
+            "role": "tool",
+            "name": "write_file",
+            "args": {"path": "hello.txt", "content": "hello"},
+            "content": "wrote hello.txt (5 chars)",
+            "created_at": "1",
+        }
+    )
+
+    result = agent.run_tool("write_file", {"path": "hello.txt", "content": "hello"})
+
+    assert result == "error: repeated identical tool call for write_file; choose a different tool or return a final answer"
 
 
 def test_welcome_screen_keeps_box_shape_for_long_paths(tmp_path):
@@ -375,6 +544,7 @@ def test_openai_compatible_client_posts_expected_responses_payload():
     assert captured["timeout"] == 30
     assert captured["headers"]["Authorization"] == "Bearer sk-test"
     assert captured["headers"]["Content-type"] == "application/json"
+    assert captured["headers"]["User-agent"] == "pico/0.1"
     assert captured["body"] == {
         "model": "right.codes/codex-mini",
         "input": [
@@ -449,6 +619,178 @@ def test_openai_compatible_client_sends_prompt_cache_fields_and_records_usage():
     assert client.last_completion_metadata["cached_tokens"] == 1536
     assert client.last_completion_metadata["cache_hit"] is True
     assert client.last_completion_metadata["input_tokens"] == 2048
+
+
+def test_openai_compatible_client_complete_with_tools_posts_tool_definitions():
+    captured = {}
+
+    class FakeResponse:
+        headers = {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "call_id": "call_1",
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"README.md\",\"start\":\"1\"}",
+                        }
+                    ]
+                }
+            ).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse()
+
+    client = OpenAICompatibleModelClient(
+        model="right.codes/codex-mini",
+        base_url="https://right.codes/v1",
+        api_key="sk-test",
+        temperature=0.2,
+        timeout=30,
+    )
+    tools = [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}]
+
+    with patch("urllib.request.urlopen", fake_urlopen):
+        response = client.complete_with_tools("hello", 42, tools=tools)
+
+    assert captured["body"]["tools"] == tools
+    assert captured["body"]["tool_choice"] == "auto"
+    assert response.tool_calls == [ToolCallRequest("call_1", "read_file", {"path": "README.md", "start": "1"})]
+
+
+def test_openai_compatible_client_messages_path_uses_responses_not_anthropic_messages():
+    captured = {}
+
+    class FakeResponse:
+        headers = {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps({"output_text": "<final>ok</final>"}).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        captured["url"] = request.full_url
+        captured["headers"] = dict(request.headers)
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse()
+
+    client = OpenAICompatibleModelClient(
+        model="right.codes/codex-mini",
+        base_url="https://right.codes/v1",
+        api_key="sk-test",
+        temperature=0.2,
+        timeout=30,
+    )
+
+    with patch("urllib.request.urlopen", fake_urlopen):
+        response = client.complete_messages_with_tools(
+            [{"role": "system", "content": "sys"}, {"role": "user", "content": "hello"}],
+            42,
+            tools=[{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}],
+        )
+
+    assert captured["url"] == "https://right.codes/v1/responses"
+    assert "x-api-key" not in {key.lower(): value for key, value in captured["headers"].items()}
+    assert captured["headers"]["Authorization"] == "Bearer sk-test"
+    assert captured["body"]["instructions"] == "sys"
+    assert response.content == "<final>ok</final>"
+
+
+def test_openai_compatible_client_chat_completions_mode_for_proxy_stations():
+    captured = {}
+
+    class FakeResponse:
+        headers = {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps({"choices": [{"message": {"content": "<final>chat ok</final>"}}]}).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        captured["url"] = request.full_url
+        captured["headers"] = dict(request.headers)
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse()
+
+    client = OpenAICompatibleModelClient(
+        model="gpt-5.5",
+        base_url="https://api.s2im7pl7e.xyz/v1",
+        api_key="sk-test",
+        temperature=0.2,
+        timeout=30,
+        api_style="chat_completions",
+    )
+
+    with patch("urllib.request.urlopen", fake_urlopen):
+        response = client.complete_messages_with_tools(
+            [{"role": "system", "content": "sys"}, {"role": "user", "content": "hello"}],
+            42,
+            tools=[{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}],
+        )
+
+    assert captured["url"] == "https://api.s2im7pl7e.xyz/v1/chat/completions"
+    assert captured["headers"]["Authorization"] == "Bearer sk-test"
+    assert captured["body"]["messages"] == [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "hello"},
+    ]
+    assert captured["body"]["max_tokens"] == 42
+    assert captured["body"]["tools"][0]["function"]["name"] == "read_file"
+    assert response.content == "<final>chat ok</final>"
+
+
+def test_openai_compatible_client_allows_user_agent_override():
+    captured = {}
+
+    class FakeResponse:
+        headers = {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps({"output_text": "<final>ok</final>"}).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        captured["headers"] = dict(request.headers)
+        return FakeResponse()
+
+    client = OpenAICompatibleModelClient(
+        model="right.codes/codex-mini",
+        base_url="https://right.codes/v1",
+        api_key="sk-test",
+        temperature=0.2,
+        timeout=30,
+        user_agent="curl/8.5.0",
+    )
+
+    with patch("urllib.request.urlopen", fake_urlopen):
+        assert client.complete("hello", 42) == "<final>ok</final>"
+
+    assert captured["headers"]["User-agent"] == "curl/8.5.0"
 
 
 def test_openai_compatible_client_extracts_text_from_event_stream():
@@ -618,6 +960,68 @@ def test_anthropic_compatible_client_extracts_first_text_block():
     assert result == "<final>ok</final>"
 
 
+def test_anthropic_compatible_client_complete_with_tools_posts_tool_schema():
+    captured = {}
+
+    class FakeResponse:
+        headers = {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "read_file",
+                            "input": {"path": "README.md", "start": "1"},
+                        }
+                    ]
+                }
+            ).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse()
+
+    client = AnthropicCompatibleModelClient(
+        model="claude-sonnet-4-5-20250929",
+        base_url="https://www.right.codes/claude-aws/v1",
+        api_key="sk-test",
+        temperature=0.2,
+        timeout=30,
+    )
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+            },
+        }
+    ]
+
+    with patch("urllib.request.urlopen", fake_urlopen):
+        response = client.complete_with_tools("hello", 42, tools=tools)
+
+    assert captured["body"]["tools"] == [
+        {
+            "name": "read_file",
+            "description": "Read",
+            "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}},
+        }
+    ]
+    assert captured["body"]["tool_choice"] == {"type": "auto"}
+    assert response.tool_calls == [ToolCallRequest("toolu_1", "read_file", {"path": "README.md", "start": "1"})]
+
+
 def test_build_agent_uses_openai_provider_and_model_override(tmp_path):
     args = type(
         "Args",
@@ -662,6 +1066,89 @@ def test_build_agent_uses_openai_provider_and_model_override(tmp_path):
     assert agent.model_client is fake_client
 
 
+def test_load_env_file_supports_export_quotes_and_preserves_existing_values(tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        '\n'.join(
+            [
+                'export OPENAI_API_KEY="sk-from-file"',
+                "OPENAI_API_BASE='https://env.example/v1'",
+                "OPENAI_MODEL=gpt-env",
+                "# ignored comment",
+                "not an assignment",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with patch.dict(os.environ, {"OPENAI_MODEL": "already-set"}, clear=True):
+        loaded = mini_cli.load_env_file(env_file)
+
+        assert os.environ["OPENAI_API_KEY"] == "sk-from-file"
+        assert os.environ["OPENAI_API_BASE"] == "https://env.example/v1"
+        assert os.environ["OPENAI_MODEL"] == "already-set"
+        assert loaded == {
+            "OPENAI_API_KEY": "sk-from-file",
+            "OPENAI_API_BASE": "https://env.example/v1",
+        }
+
+
+def test_build_agent_loads_project_env_before_openai_client(tmp_path):
+    args = mini_pkg.build_arg_parser().parse_args(["--cwd", str(tmp_path)])
+    env_file = tmp_path / "project.env"
+    env_file.write_text(
+        '\n'.join(
+            [
+                'export OPENAI_API_KEY="sk-dotenv"',
+                'export OPENAI_API_BASE="https://dotenv.example/v1"',
+                'export OPENAI_MODEL="dotenv-model"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with patch.dict(os.environ, {}, clear=True), patch("pico.cli.DEFAULT_ENV_FILE", env_file), patch(
+        "pico.cli.OpenAICompatibleModelClient"
+    ) as mock_openai:
+        agent = mini_pkg.build_agent(args)
+
+    mock_openai.assert_called_once()
+    assert mock_openai.call_args.kwargs["model"] == "dotenv-model"
+    assert mock_openai.call_args.kwargs["base_url"] == "https://dotenv.example/v1"
+    assert mock_openai.call_args.kwargs["api_key"] == "sk-dotenv"
+    assert agent.model_client is mock_openai.return_value
+
+
+def test_project_env_can_force_openai_provider_and_chat_completions_style(tmp_path):
+    args = mini_pkg.build_arg_parser().parse_args(["--cwd", str(tmp_path), "--provider", "anthropic"])
+    env_file = tmp_path / "project.env"
+    env_file.write_text(
+        '\n'.join(
+            [
+                'OPENAI_API_KEY="sk-dotenv"',
+                'OPENAI_API_BASE="https://proxy.example/v1"',
+                'OPENAI_MODEL="proxy-model"',
+                'PICO_PROVIDER="openai"',
+                'OPENAI_API_STYLE="chat_completions"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with patch.dict(os.environ, {}, clear=True), patch("pico.cli.DEFAULT_ENV_FILE", env_file), patch(
+        "pico.cli.AnthropicCompatibleModelClient",
+        side_effect=AssertionError("anthropic client should not be used"),
+    ), patch("pico.cli.OpenAICompatibleModelClient") as mock_openai:
+        agent = mini_pkg.build_agent(args)
+
+    mock_openai.assert_called_once()
+    assert mock_openai.call_args.kwargs["model"] == "proxy-model"
+    assert mock_openai.call_args.kwargs["base_url"] == "https://proxy.example/v1"
+    assert mock_openai.call_args.kwargs["api_key"] == "sk-dotenv"
+    assert mock_openai.call_args.kwargs["api_style"] == "chat_completions"
+    assert agent.model_client is mock_openai.return_value
+
+
 def test_build_arg_parser_defaults_provider_to_openai(tmp_path):
     args = mini_pkg.build_arg_parser().parse_args(["--cwd", str(tmp_path)])
 
@@ -702,7 +1189,7 @@ def test_build_agent_uses_anthropic_provider_and_openai_key_fallback(tmp_path):
             "OPENAI_API_KEY": "sk-openai-fallback",
         },
         clear=True,
-    ):
+    ), patch("pico.cli.DEFAULT_ENV_FILE", tmp_path / "missing.env"):
         with patch(
             "pico.cli.OllamaModelClient",
             side_effect=AssertionError("ollama client should not be used"),
@@ -727,7 +1214,7 @@ def test_build_agent_uses_anthropic_default_model_when_env_is_missing(tmp_path):
         os.environ,
         {},
         clear=False,
-    ):
+    ), patch("pico.cli.DEFAULT_ENV_FILE", tmp_path / "missing.env"):
         os.environ.pop("ANTHROPIC_MODEL", None)
         with patch("pico.cli.AnthropicCompatibleModelClient") as mock_anthropic:
             mini_pkg.build_agent(args)
@@ -745,7 +1232,7 @@ def test_build_agent_uses_openai_provider_by_default(tmp_path):
             "OPENAI_API_KEY": "sk-test",
         },
         clear=False,
-    ):
+    ), patch("pico.cli.DEFAULT_ENV_FILE", tmp_path / "missing.env"):
         with patch(
             "pico.cli.OllamaModelClient",
             side_effect=AssertionError("ollama client should not be used"),
@@ -853,7 +1340,6 @@ def test_prompt_budget_metadata_records_budget_decisions(tmp_path):
     agent.context_manager.section_budgets = {
         "prefix": 80,
         "memory": 80,
-        "relevant_memory": 80,
         "history": 80,
     }
 
@@ -866,169 +1352,118 @@ def test_prompt_budget_metadata_records_budget_decisions(tmp_path):
     prompt_events = [event for event in trace_events if event["event"] == "prompt_built"]
     assert prompt_events
     metadata = prompt_events[0]["prompt_metadata"]
-    relevant_section = agent.model_client.prompts[0].split("Relevant memory:\n", 1)[1].split("\n\nTranscript:", 1)[0]
 
-    assert metadata["relevant_memory"]["selected_count"] == 3
-    assert len(metadata["relevant_memory"]["rendered_notes"]) == 3
-    assert len([line for line in relevant_section.splitlines() if line.startswith("- ")]) == 3
-    assert "alpha episodic" in relevant_section
-    assert "beta episodic" in relevant_section
-    assert "gamma episodic" in relevant_section
+    assert "Relevant memory:" not in agent.model_client.prompts[0]
+    assert metadata["relevant_memory"]["selected_count"] == 0
+    assert metadata["relevant_memory"]["rendered_notes"] == []
+    assert metadata["section_order"] == ["system", "history", "current_request"]
     assert metadata["current_request"]["text"] == "recall"
     assert metadata["current_request"]["rendered_chars"] == len("recall")
 
 
-def test_prompt_metadata_refreshes_prefix_when_workspace_changes(tmp_path):
+def test_prompt_metadata_uses_context_builder_system_hash(tmp_path):
     agent = build_agent(tmp_path, [])
 
     first = agent.prompt_metadata("first", "")
     second = agent.prompt_metadata("second", "")
 
-    assert first["prefix_hash"] == second["prefix_hash"]
-    assert second["prefix_changed"] is False
-    assert second["workspace_changed"] is False
+    assert first["system_hash"] == second["system_hash"]
+    assert second["prompt_cache_key"] == second["system_hash"]
 
     (tmp_path / "README.md").write_text("demo changed\n", encoding="utf-8")
 
     third = agent.prompt_metadata("third", "")
 
-    assert third["prefix_hash"] != second["prefix_hash"]
-    assert third["prefix_changed"] is True
-    assert third["workspace_changed"] is True
-    assert "demo changed" in agent.prefix
+    assert third["system_hash"] == second["system_hash"]
+    assert third["prompt_cache_key"] == third["system_hash"]
 
 
-def test_agent_creates_checkpoint_when_context_reduction_happens_and_artifacts_only_reference_it(tmp_path):
-    agent = build_agent(tmp_path, ["<final>Done after checkpoint.</final>"])
-    for index in range(10):
-        agent.record(
+def test_runtime_checkpoint_restores_completed_and_pending_tool_messages(tmp_path):
+    agent = build_agent(tmp_path, ["<final>Recovered.</final>"])
+    agent.record({"role": "user", "content": "start", "created_at": "2026-04-14T09:00:00+00:00"})
+    checkpoint = {
+        "checkpoint_id": "ckpt_restore",
+        "assistant_message": {"role": "assistant", "content": "Working on it.", "created_at": "2026-04-14T09:00:01+00:00"},
+        "completed_tool_results": [
             {
-                "role": "user" if index % 2 == 0 else "assistant",
-                "content": f"history-{index}-" + ("A" * 260),
-                "created_at": f"2026-04-07T10:{index:02d}:00+00:00",
+                "role": "tool",
+                "name": "read_file",
+                "args": {"path": "README.md"},
+                "content": "demo",
+                "created_at": "2026-04-14T09:00:02+00:00",
             }
-        )
-    agent.memory.append_note("checkpoint note " + ("B" * 220), tags=("checkpoint",), created_at="2026-04-07T11:00:00+00:00")
-    agent.context_manager.total_budget = 900
-    agent.context_manager.section_budgets = {
-        "prefix": 120,
-        "memory": 120,
-        "relevant_memory": 120,
-        "history": 160,
+        ],
+        "pending_tool_calls": [
+            {"id": "tool_2", "function": {"name": "write_file", "arguments": {"path": "notes.txt"}}}
+        ],
     }
-
-    assert agent.ask("Resume the long task") == "Done after checkpoint."
-
-    checkpoint_state = agent.session["checkpoints"]
-    checkpoint = checkpoint_state["items"][checkpoint_state["current_id"]]
-    assert checkpoint["checkpoint_id"] == checkpoint_state["current_id"]
-    assert checkpoint["schema_version"] == "phase1-v1"
-    assert checkpoint["current_goal"] == "Resume the long task"
-    assert checkpoint["key_files"] == []
-    assert checkpoint["current_blocker"] == ""
-    assert checkpoint["next_step"]
-
-    task_state = json.loads(agent.run_store.task_state_path(agent.current_task_state).read_text(encoding="utf-8"))
-    report = json.loads(agent.run_store.report_path(agent.current_task_state).read_text(encoding="utf-8"))
-    trace_events = [
-        json.loads(line)
-        for line in agent.run_store.trace_path(agent.current_task_state).read_text(encoding="utf-8").splitlines()
-    ]
-
-    assert task_state["checkpoint_id"] == checkpoint["checkpoint_id"]
-    assert report["checkpoint_id"] == checkpoint["checkpoint_id"]
-    assert report["task_state"]["checkpoint_id"] == checkpoint["checkpoint_id"]
-    assert "current_goal" not in task_state
-    assert "current_goal" not in report
-    checkpoint_events = [event for event in trace_events if event["event"] == "checkpoint_created"]
-    assert checkpoint_events
-    assert checkpoint_events[-1]["checkpoint_id"] == checkpoint["checkpoint_id"]
-    assert "current_goal" not in checkpoint_events[-1]
-
-
-def test_resume_prompt_uses_checkpoint_state_not_just_history(tmp_path):
-    agent = build_agent(tmp_path, ["<final>checkpoint ready.</final>"])
-    agent.session["checkpoints"] = {
-        "current_id": "ckpt_manual",
-        "items": {
-            "ckpt_manual": {
-                "checkpoint_id": "ckpt_manual",
-                "parent_checkpoint_id": "",
-                "schema_version": "phase1-v1",
-                "created_at": "2026-04-14T09:00:00+00:00",
-                "current_goal": "Fix failing resume flow",
-                "completed": ["Read runtime.py"],
-                "excluded": ["Do not add branch summary"],
-                "current_blocker": "Need to re-anchor stale file facts",
-                "next_step": "Re-read runtime.py and refresh the checkpoint",
-                "key_files": [{"path": "runtime.py", "freshness": "abc"}],
-                "freshness": {"runtime.py": "abc"},
-                "summary": "Resume from the latest checkpoint",
-                "runtime_identity": {"workspace_fingerprint": "old-fingerprint"},
-            }
-        },
-    }
+    agent.session["session_metadata"]["runtime_checkpoint"] = checkpoint
     agent.session_store.save(agent.session)
 
     resumed = MiniAgent.from_session(
-        model_client=FakeModelClient(["<final>Resumed.</final>"]),
+        model_client=FakeModelClient(["<final>Recovered.</final>"]),
         workspace=build_workspace(tmp_path),
         session_store=agent.session_store,
         session_id=agent.session["id"],
         approval_policy="auto",
     )
 
-    assert resumed.ask("Continue the task") == "Resumed."
+    assert resumed.ask("Continue") == "Recovered."
+    contents = [item["content"] for item in resumed.session["history"] if item["role"] in {"assistant", "tool"}]
+    assert "Working on it." in contents
+    assert "demo" in contents
+    assert any("Task interrupted before this tool finished." in item for item in contents)
+    assert resumed.last_prompt_metadata["resume_status"] == "runtime-checkpoint-restored"
+    assert "runtime_checkpoint" not in resumed.session["session_metadata"]
 
-    prompt = resumed.model_client.prompts[-1]
-    assert "Task checkpoint:" in prompt
-    assert "Current goal: Fix failing resume flow" in prompt
-    assert "Current blocker: Need to re-anchor stale file facts" in prompt
-    assert "Next step: Re-read runtime.py and refresh the checkpoint" in prompt
 
-
-def test_resume_invalidates_stale_file_summaries_and_marks_partial_stale(tmp_path):
-    file_path = tmp_path / "runtime.py"
-    file_path.write_text("alpha\n", encoding="utf-8")
-    agent = build_agent(tmp_path, ["<final>checkpoint ready.</final>"])
-    agent.memory.set_file_summary("runtime.py", "runtime.py: alpha")
-    freshness = agent.memory.to_dict()["file_summaries"]["runtime.py"]["freshness"]
-    agent.session["checkpoints"] = {
-        "current_id": "ckpt_stale",
-        "items": {
-            "ckpt_stale": {
-                "checkpoint_id": "ckpt_stale",
-                "parent_checkpoint_id": "",
-                "schema_version": "phase1-v1",
-                "created_at": "2026-04-14T09:00:00+00:00",
-                "current_goal": "Fix stale summary handling",
-                "completed": [],
-                "excluded": [],
-                "current_blocker": "",
-                "next_step": "Re-read runtime.py",
-                "key_files": [{"path": "runtime.py", "freshness": freshness}],
-                "freshness": {"runtime.py": freshness},
-                "summary": "runtime.py is important",
-                "runtime_identity": {"workspace_fingerprint": agent.workspace.fingerprint()},
-            }
+def test_checkpoint_module_materializes_pending_tool_backfill_without_runtime(tmp_path):
+    session = {
+        "id": "session-1",
+        "history": [{"role": "user", "content": "start", "created_at": "1"}],
+        "session_metadata": {
+            "runtime_checkpoint": {
+                "checkpoint_id": "ckpt_restore",
+                "assistant_message": {"role": "assistant", "content": "Working"},
+                "completed_tool_results": [
+                    {"role": "tool", "name": "read_file", "content": "done"}
+                ],
+                "pending_tool_calls": [
+                    {"id": "tool_2", "function": {"name": "write_file", "arguments": {"path": "notes.txt"}}}
+                ],
+            },
+            "pending_user_turn": True,
         },
     }
+
+    state = checkpointlib.restore_interrupted_turn(session)
+
+    assert state["status"] == "runtime-checkpoint-restored"
+    assert "runtime_checkpoint" not in session["session_metadata"]
+    assert "pending_user_turn" not in session["session_metadata"]
+    assert session["history"][-1]["tool_call_id"] == "tool_2"
+    assert "Task interrupted before this tool finished." in session["history"][-1]["content"]
+
+
+def test_pending_user_turn_restores_error_reply_before_new_turn(tmp_path):
+    agent = build_agent(tmp_path, ["<final>Recovered.</final>"])
+    agent.record({"role": "user", "content": "unfinished request", "created_at": "2026-04-14T09:00:00+00:00"})
+    agent.session["session_metadata"]["pending_user_turn"] = True
     agent.session_store.save(agent.session)
-    file_path.write_text("beta\n", encoding="utf-8")
 
     resumed = MiniAgent.from_session(
-        model_client=FakeModelClient(["<final>Resumed.</final>"]),
+        model_client=FakeModelClient(["<final>Recovered.</final>"]),
         workspace=build_workspace(tmp_path),
         session_store=agent.session_store,
         session_id=agent.session["id"],
         approval_policy="auto",
     )
 
-    assert resumed.ask("Continue the task") == "Resumed."
-
-    assert "runtime.py" not in resumed.memory.to_dict()["file_summaries"]
-    assert resumed.last_prompt_metadata["resume_status"] == "partial-stale"
-    assert resumed.last_prompt_metadata["stale_summary_invalidations"] == 1
+    assert resumed.ask("Continue") == "Recovered."
+    assistant_messages = [item["content"] for item in resumed.session["history"] if item["role"] == "assistant"]
+    assert any("Task interrupted before a response was generated." in item for item in assistant_messages)
+    assert resumed.last_prompt_metadata["resume_status"] == "pending-user-turn-restored"
+    assert "pending_user_turn" not in resumed.session["session_metadata"]
 
 
 def test_run_shell_nonzero_with_workspace_change_is_recorded_as_partial_success(tmp_path):
@@ -1048,40 +1483,20 @@ def test_run_shell_nonzero_with_workspace_change_is_recorded_as_partial_success(
     assert agent._last_tool_result_metadata["workspace_changed"] is True
 
 
-def test_resume_marks_workspace_mismatch_when_checkpoint_runtime_identity_is_stale(tmp_path):
-    agent = build_agent(tmp_path, ["<final>checkpoint ready.</final>"])
-    agent.session["checkpoints"] = {
-        "current_id": "ckpt_workspace",
-        "items": {
-            "ckpt_workspace": {
-                "checkpoint_id": "ckpt_workspace",
-                "parent_checkpoint_id": "",
-                "schema_version": "phase1-v1",
-                "created_at": "2026-04-14T09:00:00+00:00",
-                "current_goal": "Continue after drift",
-                "completed": [],
-                "excluded": [],
-                "current_blocker": "",
-                "next_step": "Rebuild runtime state",
-                "key_files": [],
-                "freshness": {},
-                "summary": "workspace changed",
-                "runtime_identity": {"workspace_fingerprint": "outdated-fingerprint"},
-            }
-        },
-    }
-    agent.session_store.save(agent.session)
-
-    resumed = MiniAgent.from_session(
-        model_client=FakeModelClient(["<final>Resumed.</final>"]),
-        workspace=build_workspace(tmp_path),
-        session_store=agent.session_store,
-        session_id=agent.session["id"],
-        approval_policy="auto",
+def test_successful_turn_clears_runtime_checkpoint_and_pending_user_turn(tmp_path):
+    agent = build_agent(
+        tmp_path,
+        [
+            '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":1}}</tool>',
+            "<final>Done.</final>",
+        ],
     )
 
-    assert resumed.ask("Continue the task") == "Resumed."
-    assert resumed.last_prompt_metadata["resume_status"] == "workspace-mismatch"
+    assert agent.ask("Inspect README") == "Done."
+    metadata = agent.session["session_metadata"]
+
+    assert "runtime_checkpoint" not in metadata
+    assert "pending_user_turn" not in metadata
 
 
 def test_write_file_trace_records_minimum_tool_contract_fields(tmp_path):
@@ -1110,202 +1525,6 @@ def test_write_file_trace_records_minimum_tool_contract_fields(tmp_path):
     assert tool_event["diff_summary"] == ["created:notes.txt"]
 
 
-def test_resume_marks_schema_mismatch_when_checkpoint_version_is_incompatible(tmp_path):
-    agent = build_agent(tmp_path, ["<final>checkpoint ready.</final>"])
-    agent.session["checkpoints"] = {
-        "current_id": "ckpt_schema",
-        "items": {
-            "ckpt_schema": {
-                "checkpoint_id": "ckpt_schema",
-                "parent_checkpoint_id": "",
-                "schema_version": "legacy-v0",
-                "created_at": "2026-04-14T09:00:00+00:00",
-                "current_goal": "Continue after schema change",
-                "completed": [],
-                "excluded": [],
-                "current_blocker": "",
-                "next_step": "Migrate checkpoint",
-                "key_files": [],
-                "freshness": {},
-                "summary": "schema changed",
-                "runtime_identity": {"workspace_fingerprint": agent.workspace.fingerprint()},
-            }
-        },
-    }
-    agent.session_store.save(agent.session)
-
-    resumed = MiniAgent.from_session(
-        model_client=FakeModelClient(["<final>Resumed.</final>"]),
-        workspace=build_workspace(tmp_path),
-        session_store=agent.session_store,
-        session_id=agent.session["id"],
-        approval_policy="auto",
-    )
-
-    assert resumed.ask("Continue the task") == "Resumed."
-    assert resumed.last_prompt_metadata["resume_status"] == "schema-mismatch"
-
-
-def test_resume_marks_no_checkpoint_when_session_has_no_checkpoint_state(tmp_path):
-    agent = build_agent(tmp_path, ["<final>checkpoint ready.</final>"])
-    agent.session.pop("checkpoints", None)
-    agent.session_store.save(agent.session)
-
-    resumed = MiniAgent.from_session(
-        model_client=FakeModelClient(["<final>Resumed.</final>"]),
-        workspace=build_workspace(tmp_path),
-        session_store=agent.session_store,
-        session_id=agent.session["id"],
-        approval_policy="auto",
-    )
-
-    assert resumed.ask("Continue the task") == "Resumed."
-    assert resumed.last_prompt_metadata["resume_status"] == "no-checkpoint"
-    assert "Task checkpoint:" not in resumed.model_client.prompts[-1]
-
-
-def test_freshness_mismatch_creates_checkpoint_before_model_completion(tmp_path):
-    file_path = tmp_path / "runtime.py"
-    file_path.write_text("alpha\n", encoding="utf-8")
-    agent = build_agent(tmp_path, ["<final>Resumed.</final>"])
-    agent.memory.set_file_summary("runtime.py", "runtime.py: alpha")
-    freshness = agent.memory.to_dict()["file_summaries"]["runtime.py"]["freshness"]
-    agent.session["checkpoints"] = {
-        "current_id": "ckpt_freshness",
-        "items": {
-            "ckpt_freshness": {
-                "checkpoint_id": "ckpt_freshness",
-                "parent_checkpoint_id": "",
-                "schema_version": "phase1-v1",
-                "created_at": "2026-04-14T09:00:00+00:00",
-                "current_goal": "Handle freshness mismatch",
-                "completed": [],
-                "excluded": [],
-                "current_blocker": "",
-                "next_step": "Re-read runtime.py",
-                "key_files": [{"path": "runtime.py", "freshness": freshness}],
-                "freshness": {"runtime.py": freshness},
-                "summary": "runtime.py changed",
-                "runtime_identity": {"workspace_fingerprint": agent.workspace.fingerprint()},
-            }
-        },
-    }
-    agent.session_store.save(agent.session)
-    file_path.write_text("beta\n", encoding="utf-8")
-
-    assert agent.ask("Continue the task") == "Resumed."
-
-    trace_events = [
-        json.loads(line)
-        for line in agent.run_store.trace_path(agent.current_task_state).read_text(encoding="utf-8").splitlines()
-    ]
-    checkpoint_events = [event for event in trace_events if event["event"] == "checkpoint_created"]
-
-    assert checkpoint_events
-    assert checkpoint_events[0]["trigger"] == "freshness_mismatch"
-
-
-def test_runtime_identity_persists_key_execution_metadata(tmp_path):
-    workspace = build_workspace(tmp_path)
-    store = SessionStore(tmp_path / ".pico" / "sessions")
-    agent = MiniAgent(
-        model_client=FakeModelClient(["<final>Done.</final>"]),
-        workspace=workspace,
-        session_store=store,
-        approval_policy="never",
-        max_steps=9,
-        max_new_tokens=1024,
-        feature_flags={"memory": True, "relevant_memory": False},
-    )
-
-    runtime_identity = agent.session["runtime_identity"]
-
-    assert runtime_identity["session_id"] == agent.session["id"]
-    assert runtime_identity["cwd"] == str(tmp_path)
-    assert runtime_identity["approval_policy"] == "never"
-    assert runtime_identity["read_only"] is False
-    assert runtime_identity["max_steps"] == 9
-    assert runtime_identity["max_new_tokens"] == 1024
-    assert runtime_identity["feature_flags"]["memory"] is True
-    assert runtime_identity["feature_flags"]["relevant_memory"] is False
-    assert runtime_identity["shell_env_allowlist"] == list(agent.shell_env_allowlist)
-
-
-def test_resume_records_runtime_identity_mismatch_fields_in_metadata_and_trace(tmp_path):
-    agent = build_agent(tmp_path, ["<final>checkpoint ready.</final>"])
-    agent.session["checkpoints"] = {
-        "current_id": "ckpt_identity",
-        "items": {
-            "ckpt_identity": {
-                "checkpoint_id": "ckpt_identity",
-                "parent_checkpoint_id": "",
-                "schema_version": "phase1-v1",
-                "created_at": "2026-04-14T09:00:00+00:00",
-                "current_goal": "Resume with a different runtime identity",
-                "completed": [],
-                "excluded": [],
-                "current_blocker": "",
-                "next_step": "Rebuild runtime identity",
-                "key_files": [],
-                "freshness": {},
-                "summary": "identity changed",
-                "runtime_identity": {
-                    "workspace_fingerprint": agent.workspace.fingerprint(),
-                    "approval_policy": "auto",
-                    "read_only": False,
-                    "max_steps": 6,
-                    "max_new_tokens": 512,
-                    "model": "old-model",
-                    "model_client": "FakeModelClient",
-                    "feature_flags": {"memory": True, "relevant_memory": True},
-                    "shell_env_allowlist": ["PATH"],
-                    "session_id": agent.session["id"],
-                    "cwd": str(tmp_path),
-                },
-            }
-        },
-    }
-    agent.session_store.save(agent.session)
-
-    resumed = MiniAgent.from_session(
-        model_client=FakeModelClient(["<final>Resumed.</final>"]),
-        workspace=build_workspace(tmp_path),
-        session_store=agent.session_store,
-        session_id=agent.session["id"],
-        approval_policy="never",
-        max_steps=9,
-        max_new_tokens=1024,
-        feature_flags={"memory": True, "relevant_memory": False},
-    )
-
-    resumed.ask("Continue the task")
-
-    assert resumed.last_prompt_metadata["resume_status"] == "workspace-mismatch"
-    assert resumed.last_prompt_metadata["runtime_identity_mismatch_fields"] == [
-        "approval_policy",
-        "feature_flags",
-        "max_new_tokens",
-        "max_steps",
-        "model",
-        "shell_env_allowlist",
-    ]
-
-    trace_events = [
-        json.loads(line)
-        for line in resumed.run_store.trace_path(resumed.current_task_state).read_text(encoding="utf-8").splitlines()
-    ]
-    mismatch_events = [event for event in trace_events if event["event"] == "runtime_identity_mismatch"]
-    assert mismatch_events
-    assert mismatch_events[0]["fields"] == [
-        "approval_policy",
-        "feature_flags",
-        "max_new_tokens",
-        "max_steps",
-        "model",
-        "shell_env_allowlist",
-    ]
-
-
 def test_partial_success_creates_process_note_for_exploration_history(tmp_path):
     agent = build_agent(tmp_path, [])
 
@@ -1329,12 +1548,11 @@ def test_partial_success_creates_process_note_for_exploration_history(tmp_path):
     assert "README.md" in process_notes[-1]["tags"]
 
 
-def test_explicit_memory_promotion_persists_durable_memory_topics(tmp_path):
+def test_final_answer_does_not_auto_promote_durable_memory(tmp_path):
     agent = build_agent(
         tmp_path,
         [
             "<final>Project convention: Use constrained tools instead of guessing.\n"
-            "Project convention: Preserve local agent state under .pico/.\n"
             "Decision: Keep durable memory topic-based and lightweight.</final>",
         ],
     )
@@ -1344,27 +1562,17 @@ def test_explicit_memory_promotion_persists_durable_memory_topics(tmp_path):
         "Respond with exactly the long-term facts."
     )
 
-    assert "Project convention:" in answer
-
-    index_path = tmp_path / ".pico" / "memory" / "MEMORY.md"
-    conventions_path = tmp_path / ".pico" / "memory" / "topics" / "project-conventions.md"
-    decisions_path = tmp_path / ".pico" / "memory" / "topics" / "key-decisions.md"
+    memory_text = (tmp_path / ".pico" / "memory" / "MEMORY.md").read_text(encoding="utf-8")
     report = json.loads(agent.run_store.report_path(agent.current_task_state).read_text(encoding="utf-8"))
 
-    assert index_path.exists()
-    assert conventions_path.exists()
-    assert decisions_path.exists()
-    assert "project-conventions" in index_path.read_text(encoding="utf-8")
-    assert "Use constrained tools instead of guessing." in conventions_path.read_text(encoding="utf-8")
-    assert "Keep durable memory topic-based and lightweight." in decisions_path.read_text(encoding="utf-8")
-    assert report["durable_promotions"] == [
-        "project-conventions: Use constrained tools instead of guessing.",
-        "project-conventions: Preserve local agent state under .pico/.",
-        "key-decisions: Keep durable memory topic-based and lightweight.",
-    ]
+    assert "Project convention:" in answer
+    assert "Use constrained tools instead of guessing." not in memory_text
+    assert "durable_promotions" not in report
+    assert "durable_rejections" not in report
+    assert "durable_superseded" not in report
 
 
-def test_explicit_memory_promotion_supports_chinese_intent_and_labels(tmp_path):
+def test_final_answer_does_not_auto_promote_chinese_durable_memory(tmp_path):
     agent = build_agent(
         tmp_path,
         [
@@ -1375,83 +1583,31 @@ def test_explicit_memory_promotion_supports_chinese_intent_and_labels(tmp_path):
 
     answer = agent.ask("请把下面这些稳定事实记住，作为长期记忆保存下来。")
 
+    memory_text = (tmp_path / ".pico" / "memory" / "MEMORY.md").read_text(encoding="utf-8")
+
     assert "项目约定：" in answer
-
-    conventions_path = tmp_path / ".pico" / "memory" / "topics" / "project-conventions.md"
-    decisions_path = tmp_path / ".pico" / "memory" / "topics" / "key-decisions.md"
-
-    assert "优先使用受约束工具，不要靠猜。" in conventions_path.read_text(encoding="utf-8")
-    assert "持久记忆保持轻量、按 topic 管理。" in decisions_path.read_text(encoding="utf-8")
+    assert "优先使用受约束工具，不要靠猜。" not in memory_text
 
 
-def test_explicit_memory_promotion_rejects_secret_shaped_and_transient_lines(tmp_path):
+def test_final_answer_does_not_auto_promote_secret_shaped_lines(tmp_path):
     agent = build_agent(
         tmp_path,
         [
             "<final>Project convention: Use constrained tools instead of guessing.\n"
             "Dependency: API key is sk-live-secret-abc.\n"
-            "Decision: Current goal is fix flaky tests.\n"
-            "Dependency: stdout: FAIL test_one FAIL test_two FAIL test_three.</final>",
+            "Decision: Current goal is fix flaky tests.</final>",
         ],
     )
 
     agent.ask("Capture these stable facts into durable memory.")
 
     report = json.loads(agent.run_store.report_path(agent.current_task_state).read_text(encoding="utf-8"))
-    conventions_path = tmp_path / ".pico" / "memory" / "topics" / "project-conventions.md"
-    dependency_path = tmp_path / ".pico" / "memory" / "topics" / "dependency-facts.md"
+    memory_text = (tmp_path / ".pico" / "memory" / "MEMORY.md").read_text(encoding="utf-8")
 
-    assert report["durable_promotions"] == [
-        "project-conventions: Use constrained tools instead of guessing.",
-    ]
-    assert report["durable_rejections"] == [
-        "dependency-facts:secret_shaped",
-        "key-decisions:transient_task_state",
-        "dependency-facts:noisy_output",
-    ]
-    assert "Use constrained tools instead of guessing." in conventions_path.read_text(encoding="utf-8")
-    assert not dependency_path.exists()
-
-
-def test_explicit_memory_promotion_supersedes_matching_durable_fact(tmp_path):
-    agent = build_agent(
-        tmp_path,
-        [
-            "<final>Dependency: Python runtime is 3.11.</final>",
-            "<final>Dependency: Python runtime is 3.12.</final>",
-        ],
-    )
-
-    assert agent.ask("Capture this stable dependency fact into durable memory.") == "Dependency: Python runtime is 3.11."
-    assert agent.ask("Save the updated dependency fact into durable memory.") == "Dependency: Python runtime is 3.12."
-
-    dependency_path = tmp_path / ".pico" / "memory" / "topics" / "dependency-facts.md"
-    report = json.loads(agent.run_store.report_path(agent.current_task_state).read_text(encoding="utf-8"))
-    text = dependency_path.read_text(encoding="utf-8")
-
-    assert "Python runtime is 3.12." in text
-    assert "Python runtime is 3.11." not in text
-    assert report["durable_superseded"] == [
-        "dependency-facts: Python runtime is 3.11. -> Python runtime is 3.12.",
-    ]
-
-
-def test_explicit_memory_promotion_dedupes_duplicate_durable_note(tmp_path):
-    agent = build_agent(
-        tmp_path,
-        [
-            "<final>Project convention: Use constrained tools instead of guessing.</final>",
-            "<final>Project convention: Use constrained tools instead of guessing.</final>",
-        ],
-    )
-
-    agent.ask("Capture the stable fact into durable memory.")
-    agent.ask("Capture the stable fact into durable memory again.")
-
-    conventions_path = tmp_path / ".pico" / "memory" / "topics" / "project-conventions.md"
-    text = conventions_path.read_text(encoding="utf-8")
-
-    assert text.count("Use constrained tools instead of guessing.") == 1
+    assert "durable_promotions" not in report
+    assert "durable_rejections" not in report
+    assert "Use constrained tools instead of guessing." not in memory_text
+    assert "API key is sk-live-secret-abc" not in memory_text
 
 
 def test_agent_records_model_cache_metadata_in_last_prompt_metadata(tmp_path):
@@ -1479,8 +1635,8 @@ def test_agent_records_model_cache_metadata_in_last_prompt_metadata(tmp_path):
     assert agent.last_prompt_metadata["prompt_cache_supported"] is True
     assert agent.last_prompt_metadata["cached_tokens"] == 512
     assert agent.last_prompt_metadata["cache_hit"] is True
-    assert agent.last_prompt_metadata["prefix_hash"]
-    assert agent.last_prompt_metadata["prompt_cache_key"] == agent.last_prompt_metadata["prefix_hash"]
+    assert agent.last_prompt_metadata["system_hash"]
+    assert agent.last_prompt_metadata["prompt_cache_key"] == agent.last_prompt_metadata["system_hash"]
 
 
 def test_recent_transcript_entries_stay_richer_than_older_ones(tmp_path):
@@ -1507,6 +1663,7 @@ def test_recent_transcript_entries_stay_richer_than_older_ones(tmp_path):
 
 def test_public_api_exports_resolve_through_package_path():
     assert callable(build_welcome)
+    assert callable(build_tools_help)
     assert FakeModelClient is not None
     assert MiniAgent is not None
     assert OllamaModelClient is not None
@@ -1537,6 +1694,20 @@ def test_package_import_surface_includes_cli_entrypoints():
     assert callable(mini_pkg.main)
     assert callable(mini_pkg.build_agent)
     assert callable(mini_pkg.build_arg_parser)
+    assert callable(mini_pkg.build_tools_help)
+
+
+def test_build_tools_help_lists_registered_model_callable_tools(tmp_path):
+    agent = build_agent(tmp_path, [])
+
+    output = build_tools_help(agent)
+
+    assert "Model-callable tools registered" in output
+    assert "not pico> commands" in output
+    assert "- list_dir:" in output
+    assert "- read_file:" in output
+    assert "- exec:" in output
+    assert "multi_tool_use.parallel" not in output
 
 
 def test_module_execution_help_works():

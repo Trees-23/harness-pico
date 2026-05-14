@@ -6,8 +6,9 @@ from datetime import datetime
 from pathlib import Path
 
 from .evaluator import run_fixed_benchmark
+from .loop import PicoLoop as Pico
 from .models import AnthropicCompatibleModelClient, FakeModelClient, OpenAICompatibleModelClient
-from .runtime import Pico, SessionStore
+from .session_manager import SessionStore
 from .workspace import WorkspaceContext
 
 METRICS_SCHEMA_VERSION = 2

@@ -7,7 +7,9 @@ name = "pico"
 version = "0.1.0"
 description = "Small local coding agent for Ollama and OpenAI-compatible models"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+  "prompt-toolkit>=3.0.0",
+]
 
 [project.scripts]
 pico = "pico.cli:main"
@@ -19,4 +21,8 @@ dev = [
 ]
 
 [tool.setuptools]
-packages = ["pico"]
+packages = ["pico", "pico.templates", "pico.templates.memory"]
+
+[tool.setuptools.package-data]
+"pico.templates" = ["*.md", "agent/*.md", "agent/_snippets/*.md"]
+"pico.templates.memory" = ["*.md"]

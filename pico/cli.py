@@ -7,13 +7,20 @@
 
 import argparse
 import os
+import readline  # noqa: F401 - enables GNU readline editing for input() fallback.
+import shlex
 import shutil
 import sys
 import textwrap
+from pathlib import Path
 
 from .models import AnthropicCompatibleModelClient, OllamaModelClient, OpenAICompatibleModelClient
-from .runtime import Pico, SessionStore
+from .loop import PicoLoop as Pico
+from .session_manager import SessionStore
 from .workspace import WorkspaceContext, middle
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_ENV_FILE = PROJECT_ROOT / ".env"
 
 DEFAULT_SECRET_ENV_NAMES = (
     "OPENAI_API_KEY",
@@ -38,6 +45,7 @@ HELP_DETAILS = textwrap.dedent(
     """\
     Commands:
     /help    Show this help message.
+    /tools   Show model-callable tools registered in this Pico session.
     /memory  Show the agent's distilled working memory.
     /session Show the path to the saved session file.
     /reset   Clear the current session history and memory.
@@ -54,6 +62,50 @@ DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6"
 DEFAULT_ANTHROPIC_BASE_URL = "https://www.right.codes/claude/v1"
 LEGACY_SECRET_ENV_NAMES_VAR = "MINI_CODING_AGENT_SECRET_ENV_NAMES"
 SECRET_ENV_NAMES_VAR = "PICO_SECRET_ENV_NAMES"
+
+try:
+    from prompt_toolkit import prompt as _prompt_toolkit_prompt
+except Exception:  # pragma: no cover - optional dependency
+    _prompt_toolkit_prompt = None
+
+
+def _parse_env_assignment(line):
+    try:
+        parts = shlex.split(line, comments=True, posix=True)
+    except ValueError:
+        return None
+    if not parts:
+        return None
+    if parts[0] == "export":
+        parts = parts[1:]
+    if len(parts) != 1 or "=" not in parts[0]:
+        return None
+    key, value = parts[0].split("=", 1)
+    key = key.strip()
+    if not key or not key.replace("_", "").isalnum() or key[0].isdigit():
+        return None
+    return key, value
+
+
+def load_env_file(path=None, *, override=False):
+    """Load shell-style KEY=value entries from a .env file into os.environ."""
+    env_path = Path(DEFAULT_ENV_FILE if path is None else path)
+    if not env_path.is_file():
+        return {}
+    loaded = {}
+    for raw_line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parsed = _parse_env_assignment(line)
+        if parsed is None:
+            continue
+        key, value = parsed
+        if not override and key in os.environ:
+            continue
+        os.environ[key] = value
+        loaded[key] = value
+    return loaded
 
 
 def _effective_model(args, provider):
@@ -101,7 +153,7 @@ def _configured_secret_names(args):
 
 
 def _build_model_client(args):
-    provider = getattr(args, "provider", "openai")
+    provider = os.environ.get("PICO_PROVIDER") or getattr(args, "provider", "openai")
     # CLI 只负责把 provider 选择翻译成具体 client。
     # 真正的提示词格式、缓存支持、HTTP 协议差异，都封装在 models.py 里。
     if provider == "openai":
@@ -114,6 +166,7 @@ def _build_model_client(args):
             api_key=api_key,
             temperature=args.temperature,
             timeout=getattr(args, "openai_timeout", getattr(args, "ollama_timeout", 300)),
+            api_style=os.environ.get("OPENAI_API_STYLE"),
         )
     if provider == "anthropic":
         model = _effective_model(args, provider)
@@ -183,8 +236,38 @@ def build_welcome(agent, model, host):
     return "\n".join([line, *rows, line])
 
 
+def build_tools_help(agent):
+    registry = getattr(agent, "tool_registry", None)
+    if registry is None:
+        return "No tool registry is available."
+
+    definitions = registry.get_definitions()
+    if not definitions:
+        return "No tools are registered."
+
+    lines = [
+        "Model-callable tools registered for this session:",
+        "These are not pico> commands; describe your goal in natural language and Pico decides whether to call them.",
+        "",
+    ]
+    for schema in definitions:
+        function = schema.get("function", {}) if isinstance(schema, dict) else {}
+        if not isinstance(function, dict):
+            continue
+        name = str(function.get("name", "")).strip()
+        description = str(function.get("description", "")).strip()
+        if not name:
+            continue
+        line = f"- {name}"
+        if description:
+            line += f": {description}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def build_agent(args):
-    """根据 CLI 参数装配出一个可运行的 Pico 实例。
+    """
+    根据 CLI 参数装配出一个可运行的 Pico 实例。
 
     为什么存在：
     命令行参数只是字符串和开关，runtime 需要的是已经装配好的对象图：
@@ -202,14 +285,16 @@ def build_agent(args):
     # 这里是 CLI 到 runtime 的装配点：
     # 先整理 secret 名单，再采集工作区快照，随后决定是恢复旧 session
     # 还是创建一个新的 Pico 实例。
-    configured_secret_names = _configured_secret_names(args)
-    workspace = WorkspaceContext.build(args.cwd)
-    store = SessionStore(workspace.repo_root + "/.pico/sessions")
-    model = _build_model_client(args)
+    load_env_file()
+    configured_secret_names = _configured_secret_names(args) # 计算脱敏用的 secret 名单
+    workspace = WorkspaceContext.build(args.cwd) # 根据 args.cwd 构建工作区快照 WorkspaceContext
+    store = SessionStore(workspace.repo_root + "/.pico/sessions") # 创建 SessionStore
+    model = _build_model_client(args) # 构造模型客户端
     session_id = args.resume
     if session_id == "latest":
         session_id = store.latest()
-    if session_id:
+    progress_callback = _progress_printer if getattr(args, "show_progress", True) else None
+    if session_id: # 决定是恢复旧 session 还是创建新 Pico
         return Pico.from_session(
             model_client=model,
             workspace=workspace,
@@ -219,6 +304,7 @@ def build_agent(args):
             max_steps=args.max_steps,
             max_new_tokens=args.max_new_tokens,
             secret_env_names=configured_secret_names,
+            progress_callback=progress_callback,
         )
     return Pico(
         model_client=model,
@@ -228,7 +314,29 @@ def build_agent(args):
         max_steps=args.max_steps,
         max_new_tokens=args.max_new_tokens,
         secret_env_names=configured_secret_names,
+        progress_callback=progress_callback,
     )
+
+
+def _progress_printer(event, payload):
+    if event == "model_requested":
+        print(
+            f"[pico] calling model "
+            f"(attempt {payload.get('attempts', '?')}, tools {payload.get('tool_steps', '?')})...",
+            file=sys.stderr,
+            flush=True,
+        )
+    elif event == "tool_executed":
+        status = payload.get("status") or "done"
+        print(f"[pico] tool {payload.get('name', '?')} {status}", file=sys.stderr, flush=True)
+    elif event == "model_error":
+        print(f"[pico] model error: {payload.get('error', '')}", file=sys.stderr, flush=True)
+
+
+def read_repl_input(prompt_text="\npico> "):
+    if _prompt_toolkit_prompt is not None and sys.stdin.isatty() and sys.stdout.isatty():
+        return _prompt_toolkit_prompt(prompt_text)
+    return input(prompt_text)
 
 
 def build_arg_parser():
@@ -261,6 +369,7 @@ def build_arg_parser():
     parser.add_argument("--max-new-tokens", type=int, default=512, help="Maximum model output tokens per step.")
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature sent to Ollama.")
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling value sent to Ollama.")
+    parser.add_argument("--no-progress", dest="show_progress", action="store_false", help="Disable runtime progress messages.")
     return parser
 
 
@@ -288,7 +397,7 @@ def main(argv=None):
         # 交互模式：每次读取一条用户输入，交给同一个 agent，
         # 因此 session history 和 working memory 会跨轮延续。
         try:
-            user_input = input("\npico> ").strip()
+            user_input = read_repl_input().strip()
         except (EOFError, KeyboardInterrupt):
             print("")
             return 0
@@ -299,6 +408,9 @@ def main(argv=None):
             return 0
         if user_input == "/help":
             print(HELP_DETAILS)
+            continue
+        if user_input == "/tools":
+            print(build_tools_help(agent))
             continue
         if user_input == "/memory":
             print(agent.memory_text())

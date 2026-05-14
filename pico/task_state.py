@@ -37,7 +37,19 @@ class TaskState:
     final_answer: str = ""
     checkpoint_id: str = ""
     resume_status: str = ""
-
+    """
+    run_id        一次运行的ID
+    task_id       任务ID
+    user_request  用户要做什么
+    status        运行中/完成/停止
+    tool_steps    已经用了几次工具
+    attempts      模型重试次数
+    last_tool     上一步用了什么工具
+    stop_reason   为什么停止
+    final_answer  最终答案
+    checkpoint_id 当前断点ID
+    resume_status 断点能不能续跑
+    """
     @classmethod
     def create(cls, task_id, user_request, run_id=""):
         if not run_id:

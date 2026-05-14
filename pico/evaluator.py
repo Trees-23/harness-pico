@@ -9,9 +9,10 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from . import memory as memorylib
+from .loop import PicoLoop as Pico
 from .models import FakeModelClient
-from .runtime import Pico, SessionStore
 from .run_store import RunStore
+from .session_manager import SessionStore
 from .task_state import STOP_REASON_FINAL_ANSWER_RETURNED
 from .workspace import WorkspaceContext
 
@@ -478,6 +479,10 @@ class BenchmarkEvaluator:
         task_state_path = agent.run_store.task_state_path(task_state)
         report_path = agent.run_store.report_path(task_state)
         report = agent.run_store.load_report(task_state.run_id)
+        artifact_report = dict(report)
+        artifact_report.pop("durable_promotions", None)
+        artifact_report.pop("durable_rejections", None)
+        artifact_report.pop("durable_superseded", None)
 
         artifact_path = _artifact_path_for_task(task)
         artifact_file = fixture_copy_root / artifact_path
@@ -539,7 +544,7 @@ class BenchmarkEvaluator:
             "initial_task_summary_empty": initial_task_summary_empty,
             "initial_episodic_notes_empty": initial_episodic_notes_empty,
             "task_state": task_state.to_dict(),
-            "report": report,
+            "report": artifact_report,
         }
 
     def _failure_category(

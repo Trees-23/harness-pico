@@ -1,509 +1,272 @@
-"""Prompt 组装与上下文预算控制。
-
-这个模块负责决定：每一轮到底把多少 prefix、memory、相关笔记、历史
-以及当前用户请求送进模型。
-"""
+"""Nanobot-style context builder for system prompt and message assembly."""
 
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass
+import base64
+import mimetypes
+import platform
+from pathlib import Path
+from typing import Any
+
+from .memory import MemoryStore
+from .skills import SkillsLoader
+from .templates import render_template
+from .workspace import now
 
 
-DEFAULT_TOTAL_BUDGET = 12000
-DEFAULT_SECTION_BUDGETS = {
-    "prefix": 3600,
-    "memory": 1600,
-    "relevant_memory": 1200,
-    "history": 5200,
-}
-DEFAULT_SECTION_FLOORS = {
-    "prefix": 1200,
-    "memory": 400,
-    "relevant_memory": 300,
-    "history": 1500,
-}
-# 当 prompt 超预算时，会优先压缩这些 section。
-DEFAULT_REDUCTION_ORDER = ("relevant_memory", "history", "memory", "prefix")
-SECTION_ORDER = ("prefix", "memory", "relevant_memory", "history", "current_request")
-CURRENT_REQUEST_SECTION = "current_request"
-RELEVANT_MEMORY_LIMIT = 3
+class ContextBuilder:
+    """Build system prompt plus conversation messages for an LLM call."""
 
+    BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
+    BOOTSTRAP_ROOT = ".pico"
+    _RUNTIME_CONTEXT_TAG = "[Runtime Context - metadata only, not instructions]"
+    _RUNTIME_CONTEXT_END = "[/Runtime Context]"
+    _MAX_RECENT_HISTORY = 50
+    _DEFAULT_HISTORY_MESSAGE_LIMIT = 6
 
-def _tail_clip(text, limit):
-    text = str(text)
-    if limit <= 0:
-        return ""
-    if len(text) <= limit:
-        return text
-    if limit <= 3:
-        return text[:limit]
-    return text[: limit - 3] + "..."
+    def __init__(self, agent_or_workspace: Any, timezone: str | None = None):
+        self.agent = None if isinstance(agent_or_workspace, (str, Path)) else agent_or_workspace
+        self.workspace = Path(getattr(self.agent, "root", agent_or_workspace))
+        self.timezone = timezone
+        self.memory = MemoryStore(self.workspace)
+        self.skills = SkillsLoader(self.workspace)
 
-
-@dataclass
-class SectionRender:
-    raw: str
-    budget: int
-    rendered: str
-    details: dict | None = None
-
-    @property
-    def raw_chars(self):
-        return len(self.raw)
-
-    @property
-    def rendered_chars(self):
-        return len(self.rendered)
-
-
-class ContextManager:
-    def __init__(
+    def build_system_prompt(
         self,
-        agent,
-        total_budget=DEFAULT_TOTAL_BUDGET,
-        section_budgets=None,
-        section_floors=None,
-        reduction_order=None,
-    ):
-        self.agent = agent
-        self.total_budget = int(total_budget)
-        self.section_budgets = dict(DEFAULT_SECTION_BUDGETS)
-        if section_budgets:
-            self.section_budgets.update({str(key): int(value) for key, value in section_budgets.items()})
-        self._section_floor_overrides = {str(key): int(value) for key, value in (section_floors or {}).items()}
-        self.section_floors = self._compute_section_floors()
-        self.reduction_order = tuple(reduction_order or DEFAULT_REDUCTION_ORDER)
+        skill_names: list[str] | None = None,
+        channel: str | None = None,
+    ) -> str:
+        parts = [self._get_identity(channel=channel)]
 
-    def build(self, user_message):
-        """按预算组装一轮完整 prompt。
+        bootstrap = self._load_bootstrap_files()
+        if bootstrap:
+            parts.append(bootstrap)
 
-        为什么存在：
-        仅靠用户这一轮输入，模型并不知道当前仓库状态、会话里已经读过什么、
-        哪些旧信息还值得继续参考。这个函数负责把“稳定基线 + 工作记忆 +
-        相关笔记 + 历史 + 当前请求”拼成真正发给模型的 prompt。
+        memory_context = self.memory.get_memory_context()
+        if memory_context and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
+            parts.append(f"# Memory\n\n{memory_context}")
 
-        输入 / 输出：
-        - 输入：`user_message`，也就是用户当前这一轮的新请求。
-        - 输出：`(prompt, metadata)`。
-          `prompt` 是最终发送给模型的文本；
-          `metadata` 记录了每个 section 的原始长度、裁剪后的长度、是否触发了
-          预算收缩等信息，后续会进入 trace/report，便于解释这轮 prompt
-          是怎么被拼出来的。
+        always_skills = self.skills.get_always_skills()
+        requested_skills = list(skill_names or [])
+        active_skills = list(dict.fromkeys([*always_skills, *requested_skills]))
+        if active_skills:
+            always_content = self.skills.load_skills_for_context(active_skills)
+            if always_content:
+                parts.append(f"# Active Skills\n\n{always_content}")
 
-        在 agent 链路里的位置：
-        它位于 `Pico.ask()` 的每轮模型调用之前，是“真正发请求给模型”
-        的最后一道组装工序。`WorkspaceContext` 提供稳定前缀，`LayeredMemory`
-        提供工作记忆，这个函数则把它们和当前请求合成一份可控大小的 prompt。
-        """
-        user_message = str(user_message)
-        self.section_floors = self._compute_section_floors()
-        memory_enabled = True
-        relevant_memory_enabled = True
-        context_reduction_enabled = True
-        if hasattr(self.agent, "feature_enabled"):
-            memory_enabled = self.agent.feature_enabled("memory")
-            relevant_memory_enabled = self.agent.feature_enabled("relevant_memory")
-            context_reduction_enabled = self.agent.feature_enabled("context_reduction")
-        section_texts = {
-            "prefix": str(getattr(self.agent, "prefix", "")),
-            "memory": "Memory:\n- disabled" if not memory_enabled else str(self.agent.memory_text()),
-            "history": "",
-            CURRENT_REQUEST_SECTION: f"Current user request:\n{user_message}",
-        }
-        checkpoint_text = ""
-        if hasattr(self.agent, "render_checkpoint_text"):
-            checkpoint_text = str(self.agent.render_checkpoint_text() or "").strip()
-        if checkpoint_text:
-            section_texts["prefix"] = section_texts["prefix"] + "\n\n" + checkpoint_text
-        selected_notes = []
-        if memory_enabled and relevant_memory_enabled and hasattr(self.agent, "memory") and hasattr(self.agent.memory, "retrieval_candidates"):
-            selected_notes = self.agent.memory.retrieval_candidates(user_message, limit=RELEVANT_MEMORY_LIMIT)
+        skills_summary = self.skills.build_skills_summary(exclude=set(active_skills))
+        if skills_summary:
+            parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
 
-        if not context_reduction_enabled:
-            rendered = self._render_sections_without_reduction(section_texts, selected_notes=selected_notes)
-            prompt = self._assemble_prompt(rendered)
-            metadata = self._metadata(
-                prompt=prompt,
-                rendered=rendered,
-                budgets={section: render.budget for section, render in rendered.items() if section != CURRENT_REQUEST_SECTION},
-                reduction_log=[],
-                selected_notes=selected_notes,
-                user_message=user_message,
-                section_texts=section_texts,
+        entries = self.memory.read_unprocessed_history(since_cursor=self.memory.get_last_dream_cursor())
+        if entries:
+            capped = entries[-self._MAX_RECENT_HISTORY :]
+            parts.append(
+                "# Recent History\n\n"
+                + "\n".join(f"- [{entry['timestamp']}] {entry['content']}" for entry in capped)
             )
-            return prompt, metadata
 
-        budgets = dict(self.section_budgets)
-        rendered = self._render_sections(section_texts, budgets, selected_notes=selected_notes)
-        prompt = self._assemble_prompt(rendered)
-        reduction_log = []
+        return "\n\n---\n\n".join(part for part in parts if str(part).strip())
 
-        # 如果 prompt 超预算，就按固定顺序不断压缩。
-        # 这里的顺序体现了平台偏好：
-        # 先牺牲 relevant_memory，再牺牲 history，然后才动 memory 和 prefix。
-        # 最新用户请求永远不裁剪，因为那是本轮最重要的输入。
-        while len(prompt) > self.total_budget:
-            overflow = len(prompt) - self.total_budget
-            reduced = False
-            for section in self.reduction_order:
-                floor = int(self.section_floors.get(section, 0))
-                current_budget = int(budgets.get(section, 0))
-                if current_budget <= floor:
-                    continue
-                new_budget = max(floor, current_budget - overflow)
-                if new_budget >= current_budget:
-                    continue
-                reduction_log.append(
-                    {
-                        "section": section,
-                        "before_chars": current_budget,
-                        "after_chars": new_budget,
-                        "overflow_chars": overflow,
-                    }
-                )
-                budgets[section] = new_budget
-                rendered = self._render_sections(section_texts, budgets, selected_notes=selected_notes)
-                prompt = self._assemble_prompt(rendered)
-                reduced = True
-                break
-            if not reduced:
-                break
-
-        metadata = self._metadata(
-            prompt=prompt,
-            rendered=rendered,
-            budgets=budgets,
-            reduction_log=reduction_log,
-            selected_notes=selected_notes,
-            user_message=user_message,
-            section_texts=section_texts,
+    def _get_identity(self, channel: str | None = None) -> str:
+        system = platform.system()
+        runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
+        return render_template(
+            "agent/identity.md",
+            workspace_path=str(self.workspace.expanduser().resolve()),
+            runtime=runtime,
+            platform_policy=render_template("agent/platform_policy.md", system=system),
+            channel=channel or "cli",
         )
+
+    def _load_bootstrap_files(self) -> str:
+        parts: list[str] = []
+        for filename in self.BOOTSTRAP_FILES:
+            path = self.workspace / self.BOOTSTRAP_ROOT / filename
+            content = path.read_text(encoding="utf-8").strip() if path.exists() else ""
+            if content:
+                parts.append(f"## {filename}\n\n{content}")
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _is_template_content(content: str, template_path: str) -> bool:
+        try:
+            from .templates import read_template
+
+            return str(content).strip() == read_template(*template_path.split("/")).strip()
+        except Exception:
+            return False
+
+    @staticmethod
+    def _build_runtime_context(
+        channel: str | None,
+        chat_id: str | None,
+        timezone: str | None = None,
+        session_summary: str | None = None,
+    ) -> str:
+        del timezone
+        lines = [f"Current Time: {now()}"]
+        if channel:
+            lines.append(f"Channel: {channel}")
+        if chat_id:
+            lines.append(f"Chat ID: {chat_id}")
+        if session_summary:
+            lines.extend(["", "[Resumed Session]", str(session_summary).strip()])
+        return (
+            ContextBuilder._RUNTIME_CONTEXT_TAG
+            + "\n"
+            + "\n".join(lines)
+            + "\n"
+            + ContextBuilder._RUNTIME_CONTEXT_END
+        )
+
+    @staticmethod
+    def _merge_message_content(left: Any, right: Any) -> str | list[dict[str, Any]]:
+        if isinstance(left, str) and isinstance(right, str):
+            return f"{left}\n\n{right}" if left else right
+
+        def _to_blocks(value: Any) -> list[dict[str, Any]]:
+            if isinstance(value, list):
+                return [item if isinstance(item, dict) else {"type": "text", "text": str(item)} for item in value]
+            if value is None:
+                return []
+            return [{"type": "text", "text": str(value)}]
+
+        return _to_blocks(left) + _to_blocks(right)
+
+    def build_messages(
+        self,
+        history: list[dict[str, Any]],
+        current_message: str,
+        skill_names: list[str] | None = None,
+        media: list[str] | None = None,
+        channel: str | None = None,
+        chat_id: str | None = None,
+        current_role: str = "user",
+        session_summary: str | None = None,
+    ) -> list[dict[str, Any]]:
+        runtime_ctx = self._build_runtime_context(channel, chat_id, self.timezone, session_summary=session_summary)
+        user_content = self._build_user_content(current_message, media)
+        merged = f"{runtime_ctx}\n\n{user_content}" if isinstance(user_content, str) else [{"type": "text", "text": runtime_ctx}] + user_content
+        messages = [
+            {"role": "system", "content": self.build_system_prompt(skill_names, channel=channel)},
+            *list(history or []),
+        ]
+        if messages[-1].get("role") == current_role:
+            last = dict(messages[-1])
+            last["content"] = self._merge_message_content(last.get("content"), merged)
+            messages[-1] = last
+            return messages
+        messages.append({"role": current_role, "content": merged})
+        return messages
+
+    def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
+        if not media:
+            return str(text)
+        blocks: list[dict[str, Any]] = []
+        for raw_path in media:
+            path = Path(raw_path)
+            if not path.is_file():
+                continue
+            mime = mimetypes.guess_type(str(path))[0]
+            if not mime or not mime.startswith("image/"):
+                continue
+            payload = base64.b64encode(path.read_bytes()).decode("ascii")
+            blocks.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{payload}"}})
+        if not blocks:
+            return str(text)
+        return [*blocks, {"type": "text", "text": str(text)}]
+
+    def build(self, user_message: str) -> tuple[str, dict[str, Any]]:
+        """Compatibility bridge for the current string-prompt model clients."""
+        history: list[dict[str, Any]] = []
+        session_summary = ""
+        if self.agent is not None:
+            history = self.agent.session_manager.live_history(self.agent.session, max_messages=0)
+            session_summary = str(getattr(self.agent, "archived_history_summary", lambda: "")() or "")
+        history, reductions = self._reduce_history_for_prompt(history)
+        messages = self.build_messages(
+            history=history,
+            current_message=user_message,
+            channel="cli",
+            chat_id=str(getattr(self.agent, "session", {}).get("id", "")) if self.agent is not None else None,
+            session_summary=session_summary,
+        )
+        prompt = self.render_legacy_prompt(messages)
+        metadata = self._metadata(prompt, messages, user_message)
+        metadata["budget_reductions"] = reductions
         return prompt, metadata
 
-    def _render_sections_without_reduction(self, section_texts, selected_notes=None):
-        selected_notes = selected_notes or []
-        relevant_lines = ["Relevant memory:"]
-        if selected_notes:
-            relevant_lines.extend(f"- {note['text']}" for note in selected_notes)
-        else:
-            relevant_lines.append("- none")
-        relevant_raw = "\n".join(relevant_lines)
-        history = list(getattr(self.agent, "session", {}).get("history", []))
-        history_raw = self._raw_history_text(history)
-        return {
-            "prefix": SectionRender(raw=section_texts["prefix"], budget=len(section_texts["prefix"]), rendered=section_texts["prefix"], details={}),
-            "memory": SectionRender(raw=section_texts["memory"], budget=len(section_texts["memory"]), rendered=section_texts["memory"], details={}),
-            "relevant_memory": SectionRender(
-                raw=relevant_raw,
-                budget=len(relevant_raw),
-                rendered=relevant_raw,
-                details={
-                    "selected_notes": [note["text"] for note in selected_notes],
-                    "rendered_notes": [note["text"] for note in selected_notes],
-                    "selected_count": len(selected_notes),
-                    "rendered_count": len(selected_notes),
-                    "note_budget": 0,
-                },
-            ),
-            "history": SectionRender(raw=history_raw, budget=len(history_raw), rendered=history_raw, details={"rendered_entries": []}),
-            CURRENT_REQUEST_SECTION: SectionRender(
-                raw=section_texts[CURRENT_REQUEST_SECTION],
-                budget=0,
-                rendered=section_texts[CURRENT_REQUEST_SECTION],
-                details={},
-            ),
-        }
+    def _reduce_history_for_prompt(self, history: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        if not history:
+            return [], []
+        limit = int(getattr(self, "history_message_limit", self._DEFAULT_HISTORY_MESSAGE_LIMIT) or 0)
+        if limit <= 0 or len(history) <= limit:
+            return list(history), []
+        kept = list(history[-limit:])
+        dropped = len(history) - len(kept)
+        return kept, [{"section": "history", "strategy": "keep_recent_messages", "dropped_messages": dropped}]
 
-    def _compute_section_floors(self):
-        floors = {
-            section: max(20, int(budget) // 4)
-            for section, budget in self.section_budgets.items()
-        }
-        floors.update(self._section_floor_overrides)
-        return floors
+    @staticmethod
+    def messages_to_prompt(messages: list[dict[str, Any]]) -> str:
+        rendered: list[str] = []
+        for message in messages:
+            role = str(message.get("role", "")).upper() or "UNKNOWN"
+            content = message.get("content", "")
+            if isinstance(content, list):
+                content = "\n".join(str(block.get("text") or block.get("image_url") or block) for block in content)
+            rendered.append(f"{role}:\n{content}")
+        return "\n\n".join(rendered)
 
-    def _render_sections(self, section_texts, budgets, selected_notes=None):
-        rendered = {}
-        for section in SECTION_ORDER:
-            budget = budgets.get(section)
-            if section == CURRENT_REQUEST_SECTION:
-                raw = section_texts[section]
-                rendered[section] = SectionRender(raw=raw, budget=0, rendered=raw, details={})
-            elif section == "relevant_memory":
-                rendered[section] = self._render_relevant_memory(selected_notes or [], int(budget or 0))
-            elif section == "history":
-                rendered[section] = self._render_history_section(int(budget or 0))
-            else:
-                raw = section_texts[section]
-                rendered_text = _tail_clip(raw, int(budget)) if budget is not None else raw
-                rendered[section] = SectionRender(raw=raw, budget=int(budget) if budget is not None else 0, rendered=rendered_text, details={})
-        return rendered
-
-    def _render_relevant_memory(self, selected_notes, budget):
-        header = "Relevant memory:"
-        note_texts = [str(note.get("text", "")) for note in selected_notes if str(note.get("text", "")).strip()]
-        raw_lines = [header] + [f"- {text}" for text in note_texts]
-        raw = "\n".join(raw_lines) if note_texts else "\n".join([header, "- none"])
-        if not note_texts:
-            rendered = raw
-            return SectionRender(
-                raw=raw,
-                budget=budget,
-                rendered=rendered,
-                details={
-                    "selected_notes": [],
-                    "rendered_notes": [],
-                    "selected_count": 0,
-                    "rendered_count": 0,
-                    "note_budget": 0,
-                },
-            )
-
-        per_note_budget = self._per_note_budget(budget, len(note_texts), header)
-        rendered_notes = []
-        while True:
-            # 让每条 note 平分这一段的预算，避免一条超长笔记把其他笔记都挤掉。
-            rendered_notes = [_tail_clip(text, per_note_budget) for text in note_texts]
-            rendered = "\n".join([header] + [f"- {text}" for text in rendered_notes])
-            if len(rendered) <= budget or per_note_budget <= 1:
-                break
-            per_note_budget -= 1
-
-        if len(rendered) > budget and budget > 0:
-            rendered = _tail_clip(raw, budget)
-            rendered_notes = [rendered]
-
-        return SectionRender(
-            raw=raw,
-            budget=budget,
-            rendered=rendered,
-            details={
-                "selected_notes": note_texts,
-                "rendered_notes": rendered_notes,
-                "selected_count": len(note_texts),
-                "rendered_count": len(rendered_notes),
-                "note_budget": per_note_budget,
-            },
+    @classmethod
+    def render_legacy_prompt(
+        cls,
+        messages: list[dict[str, Any]],
+        relevant_notes: list[str] | None = None,
+        *,
+        include_relevant_memory: bool = False,
+    ) -> str:
+        system = str(messages[0].get("content", "")) if messages else ""
+        transcript = cls.messages_to_prompt(messages[1:] if len(messages) > 1 else [])
+        if not include_relevant_memory:
+            return f"SYSTEM:\n{system}\n\nTranscript:\n{transcript}"
+        relevant_notes = list(relevant_notes or [])
+        relevant_block = "\n".join(f"- {note}" for note in relevant_notes) if relevant_notes else "- none"
+        return (
+            f"SYSTEM:\n{system}\n\n"
+            f"Relevant memory:\n{relevant_block}\n\n"
+            f"Transcript:\n{transcript}"
         )
 
-    def _per_note_budget(self, budget, note_count, header):
-        if note_count <= 0:
-            return 0
-        overhead = len(header) + 3 * note_count
-        usable = max(0, budget - overhead)
-        return max(1, usable // note_count)
-
-    def _render_history_section(self, budget):
-        history = list(getattr(self.agent, "session", {}).get("history", []))
-        raw = self._raw_history_text(history)
-        if not history:
-            rendered = "Transcript:\n- empty"
-            return SectionRender(
-                raw=raw,
-                budget=budget,
-                rendered=rendered,
-                details={
-                    "rendered_entries": [],
-                    "older_entries_count": 0,
-                    "collapsed_duplicate_reads": 0,
-                    "reused_file_summary_count": 0,
-                    "summarized_tool_count": 0,
-                },
-            )
-
-        # 优先保留最近的历史，因为下一步决策通常最依赖刚刚发生的工具结果。
-        recent_window = 6
-        recent_start = max(0, len(history) - recent_window)
-        history_entries, history_details = self._compressed_history_entries(history, recent_start)
-        rendered_entries = []
-        for entry in reversed(history_entries):
-            recent = bool(entry.get("recent", False))
-            candidate_lines = list(entry.get("lines", []))
-            candidate_entries = candidate_lines + rendered_entries
-            candidate_rendered = "\n".join(["Transcript:", *candidate_entries])
-            if len(candidate_rendered) <= budget:
-                rendered_entries = candidate_entries
-                continue
-            if recent:
-                available = budget - len("Transcript:")
-                if rendered_entries:
-                    available -= sum(len(line) + 1 for line in rendered_entries)
-                available = max(20, available - 1)
-                candidate_lines = [_tail_clip(line, available) for line in candidate_lines]
-                candidate_entries = candidate_lines + rendered_entries
-                candidate_rendered = "\n".join(["Transcript:", *candidate_entries])
-                if len(candidate_rendered) <= budget:
-                    rendered_entries = candidate_entries
-            else:
-                smaller_lines = [_tail_clip(line, 20) for line in candidate_lines]
-                smaller_entries = smaller_lines + rendered_entries
-                smaller_rendered = "\n".join(["Transcript:", *smaller_entries])
-                if len(smaller_rendered) <= budget:
-                    rendered_entries = smaller_entries
-        rendered = "\n".join(["Transcript:", *rendered_entries])
-
-        if len(rendered) > budget and budget > 0:
-            rendered = _tail_clip(raw, budget)
-
-        return SectionRender(
-            raw=raw,
-            budget=budget,
-            rendered=rendered,
-            details={
-                "recent_window": recent_window,
-                "recent_start": recent_start,
-                "rendered_entries": rendered_entries,
-                **history_details,
-            },
-        )
-
-    def _compressed_history_entries(self, history, recent_start):
-        entries = []
-        seen_older_reads = set()
-        details = {
-            "older_entries_count": 0,
-            "collapsed_duplicate_reads": 0,
-            "reused_file_summary_count": 0,
-            "summarized_tool_count": 0,
-        }
-
-        for index, item in enumerate(history):
-            recent = index >= recent_start
-            if recent:
-                line_limit = 900
-                entries.append(
-                    {
-                        "recent": True,
-                        "lines": self._render_history_item(item, line_limit),
-                    }
-                )
-                continue
-
-            if item["role"] == "tool" and item["name"] == "read_file":
-                path = str(item["args"].get("path", "")).strip()
-                if path in seen_older_reads:
-                    details["collapsed_duplicate_reads"] += 1
-                    continue
-                seen_older_reads.add(path)
-                summary = self._reusable_file_summary(path)
-                if summary:
-                    entries.append({"recent": False, "lines": [f"{path} -> {summary}"]})
-                    details["older_entries_count"] += 1
-                    details["reused_file_summary_count"] += 1
-                    continue
-
-            if item["role"] == "tool":
-                summary_line = self._summarize_old_tool_item(item)
-                entries.append({"recent": False, "lines": [summary_line]})
-                details["older_entries_count"] += 1
-                details["summarized_tool_count"] += 1
-                continue
-
-            entries.append({"recent": False, "lines": self._render_history_item(item, 60)})
-
-        return entries, details
-
-    def _reusable_file_summary(self, path):
-        memory = getattr(self.agent, "memory", None)
-        if memory is None or not hasattr(memory, "to_dict"):
-            return ""
-        snapshot = memory.to_dict()
-        summary = snapshot.get("file_summaries", {}).get(str(path), {})
-        if not summary:
-            return ""
-        return str(summary.get("summary", "")).strip()
-
-    def _summarize_old_tool_item(self, item):
-        if item["name"] == "run_shell":
-            command = str(item["args"].get("command", "")).strip() or "shell"
-            lines = [line.strip() for line in str(item.get("content", "")).splitlines() if line.strip()]
-            summary = " | ".join(lines[:3]) if lines else "(empty)"
-            return f"{command} -> {summary}"
-        return self._render_history_item(item, 60)[0]
-
-    def _raw_history_text(self, history):
-        if not history:
-            return "Transcript:\n- empty"
-        lines = []
-        for item in history:
-            if item["role"] == "tool":
-                lines.append(f"[tool:{item['name']}] {json.dumps(item['args'], sort_keys=True)}")
-                lines.append(str(item["content"]))
-            else:
-                lines.append(f"[{item['role']}] {item['content']}")
-        return "\n".join(["Transcript:", *lines])
-
-    def _render_history_item(self, item, line_limit):
-        if item["role"] == "tool":
-            prefix = f"[tool:{item['name']}] {json.dumps(item['args'], sort_keys=True)}"
-            content = _tail_clip(item["content"], max(20, line_limit))
-            return [prefix, content]
-        return [f"[{item['role']}] {_tail_clip(item['content'], line_limit)}"]
-
-    def _assemble_prompt(self, rendered):
-        # 顺序是刻意设计的：稳定规则放前面，最新请求放最后。
-        return "\n\n".join(
-            [
-                rendered["prefix"].rendered,
-                rendered["memory"].rendered,
-                rendered["relevant_memory"].rendered,
-                rendered["history"].rendered,
-                rendered[CURRENT_REQUEST_SECTION].rendered,
-            ]
-        ).strip()
-
-    def _metadata(self, prompt, rendered, budgets, reduction_log, selected_notes, user_message, section_texts):
-        section_metadata = {}
-        for section in SECTION_ORDER[:-1]:
-            section_metadata[section] = {
-                "raw_chars": rendered[section].raw_chars,
-                "budget_chars": int(budgets.get(section, 0)),
-                "rendered_chars": rendered[section].rendered_chars,
-            }
-        section_metadata[CURRENT_REQUEST_SECTION] = {
-            "raw_chars": len(section_texts[CURRENT_REQUEST_SECTION]),
-            "budget_chars": None,
-            "rendered_chars": len(rendered[CURRENT_REQUEST_SECTION].rendered),
-        }
+    @staticmethod
+    def _metadata(
+        prompt: str,
+        messages: list[dict[str, Any]],
+        user_message: str,
+        *,
+        relevant_notes: list[str] | None = None,
+    ) -> dict[str, Any]:
+        system_text = str(messages[0].get("content", "")) if messages else ""
+        history_messages = messages[1:-1] if len(messages) > 2 else []
+        current_text = str(messages[-1].get("content", "")) if messages else ""
+        relevant_notes = list(relevant_notes or [])
         return {
             "prompt_chars": len(prompt),
-            "prompt_budget_chars": self.total_budget,
-            "prompt_over_budget": len(prompt) > self.total_budget,
-            "section_order": list(SECTION_ORDER),
-            "section_budgets": {
-                section: (None if section == CURRENT_REQUEST_SECTION else int(budgets.get(section, 0)))
-                for section in SECTION_ORDER
+            "section_order": ["system", "history", "current_request"],
+            "sections": {
+                "system": {"rendered_chars": len(system_text), "raw_chars": len(system_text)},
+                "history": {"rendered_chars": sum(len(str(item.get("content", ""))) for item in history_messages)},
+                "current_request": {"rendered_chars": len(current_text), "raw_chars": len(str(user_message))},
             },
-            "sections": section_metadata,
-            "budget_reductions": reduction_log,
-            "reduction_order": list(self.reduction_order),
+            "history": {"rendered_entries": len(history_messages)},
             "relevant_memory": {
-                "limit": RELEVANT_MEMORY_LIMIT,
-                "selected_count": len(selected_notes),
-                "selected_notes": [note["text"] for note in selected_notes],
-                "selected_sources": [str(note.get("source", "")).strip() for note in selected_notes],
-                "selected_kinds": [str(note.get("kind", "episodic")).strip() or "episodic" for note in selected_notes],
-                "selected_durable_count": sum(
-                    1 for note in selected_notes if (str(note.get("kind", "episodic")).strip() or "episodic") == "durable"
-                ),
-                "raw_chars": rendered["relevant_memory"].raw_chars,
-                "rendered_chars": rendered["relevant_memory"].rendered_chars,
-                "rendered_notes": list(rendered["relevant_memory"].details.get("rendered_notes", [])),
-                "rendered_count": int(rendered["relevant_memory"].details.get("rendered_count", 0)),
+                "selected_count": len(relevant_notes),
+                "rendered_notes": list(relevant_notes),
             },
-            "history": {
-                "raw_chars": rendered["history"].raw_chars,
-                "rendered_chars": rendered["history"].rendered_chars,
-                "older_entries_count": int(rendered["history"].details.get("older_entries_count", 0)),
-                "collapsed_duplicate_reads": int(rendered["history"].details.get("collapsed_duplicate_reads", 0)),
-                "reused_file_summary_count": int(rendered["history"].details.get("reused_file_summary_count", 0)),
-                "summarized_tool_count": int(rendered["history"].details.get("summarized_tool_count", 0)),
-            },
-            "current_request": {
-                "text": user_message,
-                "raw_chars": len(user_message),
-                "rendered_chars": len(user_message),
-                "section_chars": len(rendered[CURRENT_REQUEST_SECTION].rendered),
-            },
+            "current_request": {"text": str(user_message), "rendered_chars": len(str(user_message))},
+            "budget_reductions": [],
+            "context_builder": "nanobot-style",
         }
+
+
+ContextManager = ContextBuilder

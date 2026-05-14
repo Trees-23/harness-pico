@@ -15,8 +15,10 @@ MAX_TOOL_OUTPUT = 4000
 MAX_HISTORY = 12000
 # 这些文件最可能直接影响 agent 的行动方式。
 # 我们不会预加载整个仓库，只会先给模型一小份“导航包”。
-DOC_NAMES = ("AGENTS.md", "README.md", "pyproject.toml", "package.json")
-IGNORED_PATH_NAMES = {".git", ".pico", "__pycache__", ".pytest_cache", ".ruff_cache", ".venv", "venv"}
+# 在让 AI 开始读代码、写代码之前，先快速扫描一遍你的项目，生成一份极简摘要，发给 AI，让 AI 立刻知道自己在哪个项目里干活。
+
+DOC_NAMES = (".pico/AGENTS.md", "README.md", "pyproject.toml", "package.json") # 只给ai看这些
+IGNORED_PATH_NAMES = {".git", ".pico", "__pycache__", ".pytest_cache", ".ruff_cache", ".venv", "venv"} # 忽略这些不扫描
 
 
 def now():
@@ -43,6 +45,14 @@ def middle(text, limit):
 
 class WorkspaceContext:
     def __init__(self, cwd, repo_root, branch, default_branch, status, recent_commits, project_docs):
+        """ cwd：你当前在哪个文件夹
+            repo_root：项目根目录在哪
+            branch：当前 Git 分支
+            default_branch：主分支（main/master）
+            status：Git 状态（干净 / 有修改）
+            recent_commits：最近 5 条提交记录
+            project_docs：README、配置文件片段
+        """
         self.cwd = cwd
         self.repo_root = repo_root
         self.branch = branch

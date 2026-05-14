@@ -1,5 +1,6 @@
 import os
 import shlex
+import socket
 import sys
 from unittest.mock import patch
 
@@ -65,6 +66,9 @@ def test_cli_build_agent_wires_secret_env_names_from_parser(tmp_path):
 
     (tmp_path / "README.md").write_text("demo\n", encoding="utf-8")
     with patch.dict(os.environ, {"GITHUB_PAT": "ghp-1", "GH_PAT": "ghp-2"}, clear=True), patch(
+        "pico.cli.DEFAULT_ENV_FILE",
+        tmp_path / "missing.env",
+    ), patch(
         "pico.cli.OllamaModelClient",
         DummyModelClient,
     ):
@@ -95,6 +99,9 @@ def test_cli_build_agent_uses_default_configured_secret_names(tmp_path):
 
     (tmp_path / "README.md").write_text("demo\n", encoding="utf-8")
     with patch.dict(os.environ, {"GH_PAT": "ghp-default-1"}, clear=True), patch(
+        "pico.cli.DEFAULT_ENV_FILE",
+        tmp_path / "missing.env",
+    ), patch(
         "pico.cli.OllamaModelClient",
         DummyModelClient,
     ):
@@ -120,7 +127,7 @@ def test_cli_build_agent_reads_secret_names_from_environment_config(tmp_path):
             "MINI_CODING_AGENT_SECRET_ENV_NAMES": "MCA_CUSTOM_SECRET",
         },
         clear=True,
-    ), patch("pico.cli.OllamaModelClient", DummyModelClient):
+    ), patch("pico.cli.DEFAULT_ENV_FILE", tmp_path / "missing.env"), patch("pico.cli.OllamaModelClient", DummyModelClient):
         args = mini_cli.build_arg_parser().parse_args(["--cwd", str(tmp_path), "--approval", "auto"])
         agent = mini_cli.build_agent(args)
         assert agent.secret_env_summary()["secret_env_names"] == ["MCA_CUSTOM_SECRET"]
@@ -139,10 +146,27 @@ def test_run_shell_uses_allowlisted_environment_only(tmp_path):
     assert "missing" in result
 
 
-def test_bound_tool_methods_delegate_into_tools_module(tmp_path):
+def test_run_shell_blocks_internal_urls_before_execution(tmp_path, monkeypatch):
+    def fake_getaddrinfo(hostname, port, family=0, type=0):
+        del hostname, port, family, type
+        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", 0))]
+
+    agent = build_agent(tmp_path, [], approval_policy="auto")
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+    with patch("pico.tooling.capabilities.subprocess.run") as fake_run:
+        result = agent.run_tool("run_shell", {"command": "curl http://localhost:11434", "timeout": 20})
+
+    assert "internal/private URL detected" in result
+    assert agent._last_tool_result_metadata["tool_status"] == "rejected"
+    assert agent._last_tool_result_metadata["security_event_type"] == "internal_url_block"
+    fake_run.assert_not_called()
+
+
+def test_bound_tool_methods_delegate_into_tooling_capabilities(tmp_path):
     agent = build_agent(tmp_path, [], approval_policy="auto")
 
-    with patch("pico.tools.subprocess.run") as fake_run:
+    with patch("pico.tooling.capabilities.subprocess.run") as fake_run:
         fake_run.return_value = type(
             "Result",
             (),
@@ -154,7 +178,7 @@ def test_bound_tool_methods_delegate_into_tools_module(tmp_path):
     fake_run.assert_called_once()
     assert agent.tool_run_shell.__func__.__module__ == "pico.runtime"
 
-    with patch("pico.tools.tool_delegate", return_value="toolkit-delegate") as fake_delegate:
+    with patch("pico.tooling.capabilities.tool_delegate", return_value="toolkit-delegate") as fake_delegate:
         delegate_result = agent.tool_delegate({"task": "inspect README.md", "max_steps": 2})
 
     assert delegate_result == "toolkit-delegate"

@@ -1,9 +1,13 @@
 from pico import FakeModelClient, MiniAgent, SessionStore, WorkspaceContext
-from pico.context_manager import ContextManager
+from pico.context_manager import ContextBuilder, ContextManager
+from pico.memory import MemoryStore
+from pico.templates import read_template
 
 
 def build_workspace(tmp_path):
     (tmp_path / "README.md").write_text("demo\n", encoding="utf-8")
+    (tmp_path / ".pico").mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".pico" / "AGENTS.md").write_text("Follow workspace instructions.\n", encoding="utf-8")
     return WorkspaceContext.build(tmp_path)
 
 
@@ -20,220 +24,164 @@ def build_agent(tmp_path, outputs, **kwargs):
     )
 
 
-def test_context_manager_assembles_sections_in_expected_order(tmp_path):
+def test_context_builder_loads_identity_bootstrap_memory_and_recent_history(tmp_path):
+    (tmp_path / ".pico").mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".pico" / "AGENTS.md").write_text("Follow workspace instructions.\n", encoding="utf-8")
+    (tmp_path / ".pico" / "SOUL.md").write_text("Be concise.\n", encoding="utf-8")
+    store = MemoryStore(tmp_path)
+    store.write_memory("# Long-term Memory\n\n- User likes direct answers.\n")
+    store.append_history("- User prefers Chinese technical explanations.")
+
+    system = ContextBuilder(tmp_path).build_system_prompt(channel="cli")
+
+    assert "## Runtime" in system
+    assert "## AGENTS.md" in system
+    assert "Follow workspace instructions." in system
+    assert "## SOUL.md" in system
+    assert "Be concise." in system
+    assert "# Memory" in system
+    assert "User likes direct answers." in system
+    assert "# Recent History" in system
+    assert "User prefers Chinese technical explanations." in system
+
+
+def test_context_builder_builds_messages_with_runtime_context_before_current_request(tmp_path):
+    build_workspace(tmp_path)
+    builder = ContextBuilder(tmp_path)
+    history = [{"role": "assistant", "content": "previous answer"}]
+
+    messages = builder.build_messages(history, "continue", channel="cli", chat_id="session-1", session_summary="- old summary")
+
+    assert messages[0]["role"] == "system"
+    assert messages[1] == {"role": "assistant", "content": "previous answer"}
+    assert messages[2]["role"] == "user"
+    assert "[Runtime Context - metadata only, not instructions]" in messages[2]["content"]
+    assert "[Resumed Session]" in messages[2]["content"]
+    assert messages[2]["content"].rstrip().endswith("continue")
+
+
+def test_context_builder_merges_current_request_into_existing_user_turn(tmp_path):
+    build_workspace(tmp_path)
+    builder = ContextBuilder(tmp_path)
+    history = [{"role": "user", "content": "我有几只宠物"}]
+
+    messages = builder.build_messages(history, "我有几只宠物", channel="cli")
+
+    assert len(messages) == 2
+    assert messages[1]["role"] == "user"
+    assert messages[1]["content"].count("我有几只宠物") == 2
+    assert "[Runtime Context - metadata only, not instructions]" in messages[1]["content"]
+
+
+def test_context_builder_uses_materialized_workspace_bootstrap_files(tmp_path):
+    (tmp_path / "README.md").write_text("demo\n", encoding="utf-8")
+    MemoryStore(tmp_path)
+    (tmp_path / ".pico" / "AGENTS.md").write_text("Workspace AGENTS override.\n", encoding="utf-8")
+
+    system = ContextBuilder(tmp_path).build_system_prompt(channel="cli")
+
+    assert "Workspace AGENTS override." in system
+    assert "## AGENTS.md" in system
+
+
+def test_context_builder_injects_active_skills_and_skills_summary(tmp_path):
+    build_workspace(tmp_path)
+    always_dir = tmp_path / "skills" / "always"
+    always_dir.mkdir(parents=True)
+    (always_dir / "SKILL.md").write_text(
+        "---\ndescription: Always skill\nalways: true\n---\nAlways body\n",
+        encoding="utf-8",
+    )
+    lazy_dir = tmp_path / "skills" / "lazy"
+    lazy_dir.mkdir(parents=True)
+    (lazy_dir / "SKILL.md").write_text(
+        "---\ndescription: Lazy skill\n---\nLazy body\n",
+        encoding="utf-8",
+    )
+    MemoryStore(tmp_path).append_history("- Recent fact.")
+
+    system = ContextBuilder(tmp_path).build_system_prompt(channel="cli")
+
+    assert "# Active Skills" in system
+    assert "### Skill: always" in system
+    assert "Always body" in system
+    assert "# Skills" in system
+    assert "**lazy**" in system
+    assert "Lazy skill" in system
+    assert system.index("# Active Skills") < system.index("# Skills") < system.index("# Recent History")
+
+
+def test_templates_are_loaded_from_packaged_pico_runtime_directory(tmp_path, monkeypatch):
+    repo_template = tmp_path / "templates" / "TOOLS.md"
+    repo_template.parent.mkdir(parents=True)
+    repo_template.write_text("external repo template should not be loaded\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    tools_template = read_template("TOOLS.md")
+    identity_template = read_template("agent", "identity.md")
+
+    assert "external repo template" not in tools_template
+    assert "# Tool Usage Notes" in tools_template
+    assert "## Runtime" in identity_template
+
+
+def test_context_manager_alias_keeps_runtime_string_prompt_bridge(tmp_path):
     agent = build_agent(tmp_path, [])
-    agent.memory.append_note("deploy key is red", tags=("deploy",), created_at="2026-04-07T10:00:00+00:00")
-    agent.record({"role": "user", "content": "old request", "created_at": "2026-04-07T09:59:00+00:00"})
-    agent.record({"role": "assistant", "content": "old answer", "created_at": "2026-04-07T10:00:30+00:00"})
+    agent.record({"role": "user", "content": "old request", "created_at": "2026-05-06T10:00:00+00:00"})
+    agent.memory.append_note("old request should not be duplicated through Relevant memory", tags=("new",))
 
-    prompt, metadata = ContextManager(agent).build("Where is the deploy key?")
+    prompt, metadata = ContextManager(agent).build("new request")
 
-    assert prompt.index("You are pico") < prompt.index("Memory:")
-    assert prompt.index("Memory:") < prompt.index("Relevant memory:")
-    assert prompt.index("Relevant memory:") < prompt.index("Transcript:")
-    assert prompt.index("Transcript:") < prompt.index("Current user request:")
-    assert prompt.rstrip().endswith("Current user request:\nWhere is the deploy key?")
-    assert metadata["section_order"] == ["prefix", "memory", "relevant_memory", "history", "current_request"]
+    assert "SYSTEM:" in prompt
+    assert "USER:" in prompt
+    assert "Relevant memory:" not in prompt
+    assert "old request should not be duplicated" not in prompt
+    assert "old request" in prompt
+    assert prompt.rstrip().endswith("new request")
+    assert metadata["section_order"] == ["system", "history", "current_request"]
+    assert "relevant_memory" not in metadata["sections"]
+    assert metadata["relevant_memory"]["selected_count"] == 0
+    assert metadata["context_builder"] == "nanobot-style"
+    assert metadata["budget_reductions"] == []
 
 
-def test_context_manager_reduces_relevant_memory_before_history_and_preserves_newer_context(tmp_path):
+def test_save_turn_sanitizes_runtime_context_and_media_blocks(tmp_path):
     agent = build_agent(tmp_path, [])
-    agent.prefix = "PREFIX " + ("A" * 600)
-    agent.memory.render_memory_text = lambda: "MEMORY " + ("B" * 600)
-    agent.memory.append_note("keep episodic note one " + ("C" * 220), tags=("keep",), created_at="2026-04-07T10:00:00+00:00")
-    agent.memory.append_note("keep episodic note two " + ("D" * 220), tags=("keep",), created_at="2026-04-07T10:01:00+00:00")
-    agent.memory.append_note("keep episodic note three " + ("E" * 220), tags=("keep",), created_at="2026-04-07T10:02:00+00:00")
-    agent.record({"role": "user", "content": "OLD-CONTEXT " + ("D" * 260), "created_at": "2026-04-07T09:59:00+00:00"})
-    for minute in range(1, 8):
-        role = "assistant" if minute % 2 == 1 else "user"
-        content = "RECENT-CONTEXT " + ("E" * 260) if minute == 7 else f"recent-{minute} " + ("E" * 180)
-        agent.record({"role": role, "content": content, "created_at": f"2026-04-07T10:0{minute}:00+00:00"})
-
-    manager = ContextManager(
-        agent,
-        total_budget=700,
-        section_budgets={
-            "prefix": 120,
-            "memory": 120,
-            "relevant_memory": 120,
-            "history": 400,
-        },
+    runtime = ContextBuilder._build_runtime_context("cli", "session-1")
+    agent._save_turn(
+        [
+            {"role": "user", "content": f"{runtime}\n\nhello"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": runtime},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,abc"},
+                        "_meta": {"path": "image.png"},
+                    },
+                    {"type": "text", "text": "caption"},
+                ],
+            },
+            {"role": "assistant", "content": ""},
+        ]
     )
 
-    prompt, metadata = manager.build("keep this request verbatim")
-
-    for section in ("prefix", "memory", "relevant_memory", "history"):
-        assert metadata["sections"][section]["rendered_chars"] <= metadata["sections"][section]["budget_chars"]
-
-    reduction_sections = [entry["section"] for entry in metadata["budget_reductions"]]
-    assert reduction_sections[0] == "relevant_memory"
-    assert reduction_sections
-    assert "RECENT-CONTEXT" in prompt
-    assert "OLD-CONTEXT" not in prompt
-    assert "keep this request verbatim" in prompt
-
-
-def test_context_manager_renders_top_three_episodic_notes_per_note_under_budget(tmp_path):
-    agent = build_agent(tmp_path, [])
-    agent.memory.append_note("alpha episodic note " + ("A" * 120), tags=("recall",), created_at="2026-04-07T10:00:00+00:00")
-    agent.memory.append_note("beta episodic recall note " + ("B" * 120), created_at="2026-04-07T10:01:00+00:00")
-    agent.memory.append_note("gamma episodic note " + ("C" * 120), tags=("recall",), created_at="2026-04-07T10:02:00+00:00")
-    agent.memory.append_note("older unmatched note", created_at="2026-04-07T09:59:00+00:00")
-    agent.memory.append_note("Unrelated note", created_at="2026-04-07T11:00:00+00:00")
-
-    prompt, metadata = ContextManager(
-        agent,
-        total_budget=250,
-        section_budgets={
-            "prefix": 60,
-            "memory": 60,
-            "relevant_memory": 80,
-            "history": 60,
-        },
-    ).build("recall")
-
-    assert metadata["relevant_memory"]["selected_count"] == 3
-    assert metadata["relevant_memory"]["limit"] == 3
-    assert metadata["relevant_memory"]["selected_notes"] == [
-        "gamma episodic note " + ("C" * 120),
-        "alpha episodic note " + ("A" * 120),
-        "beta episodic recall note " + ("B" * 120),
+    assert agent.session["history"][0]["content"] == "hello"
+    assert agent.session["history"][1]["content"] == [
+        {"type": "text", "text": "[Image omitted from saved session: image.png]"},
+        {"type": "text", "text": "caption"},
     ]
-    assert len(metadata["relevant_memory"]["rendered_notes"]) == 3
-    assert metadata["relevant_memory"]["rendered_count"] == 3
-    assert metadata["relevant_memory"]["rendered_notes"][0].startswith("gamma episodi")
-    assert metadata["relevant_memory"]["rendered_notes"][1].startswith("alpha episodi")
-    assert metadata["relevant_memory"]["rendered_notes"][2].startswith("beta episodi")
-    relevant_section = prompt.split("Relevant memory:\n", 1)[1].split("\n\nTranscript:", 1)[0]
-    assert len([line for line in relevant_section.splitlines() if line.startswith("- ")]) == 3
-    assert "alpha episodi" in relevant_section
-    assert "beta episodic" in relevant_section
-    assert "gamma episodi" in relevant_section
-    assert "older unmatched note" not in relevant_section
+    assert len(agent.session["history"]) == 2
 
 
-def test_context_manager_preserves_current_request_when_over_budget(tmp_path):
+def test_record_uses_persistence_sanitizer(tmp_path):
     agent = build_agent(tmp_path, [])
-    agent.prefix = "PREFIX " + ("A" * 600)
-    agent.memory.render_memory_text = lambda: "MEMORY " + ("B" * 600)
-    agent.memory.retrieval_view = lambda query, limit=3: "Relevant memory:\n" + "\n".join(f"- {i} " + ("C" * 220) for i in range(5))
-    agent.history_text = lambda: "Transcript:\n" + "\n".join(f"[user] {i} " + ("D" * 220) for i in range(5))
+    runtime = ContextBuilder._build_runtime_context("cli", "session-1")
 
-    request = "please preserve this request exactly"
-    prompt, metadata = ContextManager(
-        agent,
-        total_budget=250,
-        section_budgets={
-            "prefix": 80,
-            "memory": 80,
-            "relevant_memory": 80,
-            "history": 80,
-        },
-    ).build(request)
+    agent.record({"role": "user", "content": f"{runtime}\n\nhello"})
+    agent.record({"role": "assistant", "content": ""})
 
-    assert prompt.split("Current user request:\n", 1)[1] == request
-    assert metadata["current_request"]["text"] == request
-    assert metadata["current_request"]["rendered_chars"] == len(request)
-
-
-def test_context_manager_collapses_older_duplicate_reads_into_one_summary_line(tmp_path):
-    file_path = tmp_path / "sample.txt"
-    file_path.write_text("alpha\nbeta\n", encoding="utf-8")
-    agent = build_agent(tmp_path, [])
-    agent.memory.set_file_summary("sample.txt", "alpha | beta")
-    agent.memory.remember_file("sample.txt")
-
-    for created_at in ("2026-04-07T09:00:00+00:00", "2026-04-07T09:01:00+00:00"):
-        agent.record(
-            {
-                "role": "tool",
-                "name": "read_file",
-                "args": {"path": "sample.txt", "start": 1, "end": 2},
-                "content": "# sample.txt\nalpha\nbeta\n",
-                "created_at": created_at,
-            }
-        )
-
-    for minute in range(2, 8):
-        role = "user" if minute % 2 == 0 else "assistant"
-        agent.record(
-            {
-                "role": role,
-                "content": f"recent-{minute}",
-                "created_at": f"2026-04-07T09:0{minute}:00+00:00",
-            }
-        )
-
-    prompt, metadata = ContextManager(agent).build("check the file")
-    transcript = prompt.split("\n\nTranscript:\n", 1)[1].split("\n\nCurrent user request:", 1)[0]
-
-    assert transcript.count("[tool:read_file]") == 0
-    assert "sample.txt -> alpha | beta" in transcript
-    assert metadata["history"]["older_entries_count"] == 1
-    assert metadata["history"]["collapsed_duplicate_reads"] == 1
-    assert metadata["history"]["reused_file_summary_count"] == 1
-
-
-def test_context_manager_summarizes_older_tool_output_into_one_line(tmp_path):
-    agent = build_agent(tmp_path, [])
-    agent.record(
-        {
-            "role": "tool",
-            "name": "run_shell",
-            "args": {"command": "pytest -q"},
-            "content": "FAIL test_one\nFAIL test_two\nFAIL test_three\nFAIL test_four\n",
-            "created_at": "2026-04-07T09:00:00+00:00",
-        }
-    )
-
-    for minute in range(1, 7):
-        role = "user" if minute % 2 == 1 else "assistant"
-        agent.record(
-            {
-                "role": role,
-                "content": f"recent-{minute}",
-                "created_at": f"2026-04-07T09:0{minute}:00+00:00",
-            }
-        )
-
-    prompt, metadata = ContextManager(agent).build("check failures")
-    transcript = prompt.split("\n\nTranscript:\n", 1)[1].split("\n\nCurrent user request:", 1)[0]
-
-    assert 'pytest -q -> FAIL test_one | FAIL test_two | FAIL test_three' in transcript
-    assert "FAIL test_four" not in transcript
-    assert metadata["history"]["summarized_tool_count"] == 1
-    assert metadata["history"]["reused_file_summary_count"] == 0
-
-
-def test_context_manager_relevant_memory_can_mix_durable_notes(tmp_path):
-    memory_root = tmp_path / ".pico" / "memory"
-    topics_dir = memory_root / "topics"
-    topics_dir.mkdir(parents=True)
-    (memory_root / "MEMORY.md").write_text(
-        "# Durable Memory Index\n\n"
-        "- [project-conventions](topics/project-conventions.md): Project Conventions\n"
-        "  - summary: Stable repository conventions.\n"
-        "  - tags: convention\n",
-        encoding="utf-8",
-    )
-    (topics_dir / "project-conventions.md").write_text(
-        "# Project Conventions\n\n"
-        "- topic: project-conventions\n"
-        "- summary: Stable repository conventions.\n"
-        "- tags: convention\n"
-        "- updated_at: 2026-04-12T08:14:49+00:00\n\n"
-        "## Notes\n"
-        "- Use constrained tools instead of guessing.\n",
-        encoding="utf-8",
-    )
-
-    agent = build_agent(tmp_path, [])
-
-    prompt, metadata = ContextManager(agent).build("What conventions should I follow?")
-    relevant_section = prompt.split("Relevant memory:\n", 1)[1].split("\n\nTranscript:", 1)[0]
-
-    assert "Use constrained tools instead of guessing." in relevant_section
-    assert any("Use constrained tools instead of guessing." in item for item in metadata["relevant_memory"]["selected_notes"])
-    assert metadata["relevant_memory"]["selected_durable_count"] == 1
-    assert metadata["relevant_memory"]["selected_sources"] == ["project-conventions"]
-    assert metadata["relevant_memory"]["selected_kinds"] == ["durable"]
+    assert len(agent.session["history"]) == 1
+    assert agent.session["history"][0]["role"] == "user"
+    assert agent.session["history"][0]["content"] == "hello"
